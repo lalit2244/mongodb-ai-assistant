@@ -199,10 +199,15 @@ def make_layout(title, x_label="", y_label="", money_y=False):
 
 # ── Chart renderer ─────────────────────────────────────────────────────────────
 
-def render_charts(results, chart_meta, plan):
+def render_charts(results, chart_meta, plan, chart_key=""):
     if not results: return
     df = safe_df(results)
     if df.empty: return
+
+    # Unique key prefix for all plotly charts in this render call
+    import hashlib, time
+    key_base = chart_key or hashlib.md5(
+        (str(results[:2]) + str(time.time())).encode()).hexdigest()[:8]
 
     cs      = (plan or {}).get("chart_suggestion") or {}
     stype   = cs.get("type", "bar")
@@ -297,7 +302,7 @@ def render_charts(results, chart_meta, plan):
             lo["xaxis"]["tickangle"] = -38
             lo["barmode"] = "group"
             fig.update_layout(**lo)
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, use_container_width=True, key=f"bar_{key_base}")
 
         # ── DONUT ──────────────────────────────────────────────────────────────
         with tab_map["🥧 Donut"]:
@@ -335,7 +340,7 @@ def render_charts(results, chart_meta, plan):
             lo["legend"]["x"] = 1.02
             lo["margin"] = dict(l=20, r=160, t=65, b=20)
             fig.update_layout(**lo)
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, use_container_width=True, key=f"donut_{key_base}")
 
         # ── LINE ───────────────────────────────────────────────────────────────
         with tab_map["📈 Line"]:
@@ -374,7 +379,7 @@ def render_charts(results, chart_meta, plan):
             lo = make_layout(title, lx_label, y_label, money_y)
             lo["xaxis"]["tickangle"] = -35
             fig.update_layout(**lo)
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, use_container_width=True, key=f"line_{key_base}")
 
     # ── 3. Only numeric columns (multi-KPI) ───────────────────────────────────
     elif num_cols:
@@ -481,8 +486,7 @@ st.markdown("""
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-# Render history
-for msg in st.session_state.messages:
+for idx, msg in enumerate(st.session_state.messages):
     r = msg["role"]
     if r == "user":
         st.markdown(f'<div class="mu"><span style="color:#60a5fa;font-weight:700;font-size:12px;">'
@@ -491,7 +495,8 @@ for msg in st.session_state.messages:
         st.markdown(f'<div class="ma"><span style="color:#10b981;font-weight:700;font-size:12px;">'
                     f'AI ANALYSIS</span><br><br>{msg["content"]}</div>', unsafe_allow_html=True)
         if msg.get("results"):
-            render_charts(msg["results"], msg.get("chart_data"), msg.get("plan"))
+            render_charts(msg["results"], msg.get("chart_data"), msg.get("plan"),
+                          chart_key=f"msg{idx}")
         if msg.get("plan"):
             with st.expander("🔍 MongoDB Query Plan"):
                 safe_plan = {k:v for k,v in (msg["plan"] or {}).items() if k != "df"}
