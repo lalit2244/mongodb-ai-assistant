@@ -99,6 +99,14 @@ def fuzzy_score(query:str, candidate:str)->float:
     if not q or not c: return 0.0
     if q == c: return 1.0
     if q in c or c in q: return 0.92
+
+    # Handle merged words: "namoestimate" should match "namo estimate"
+    # Expand candidate by removing separators so "namo estimate" → "namoestimate"
+    c_merged = re.sub(r"\s","",c)
+    q_merged = re.sub(r"\s","",q)
+    if q_merged == c_merged: return 0.98
+    if q_merged in c_merged or c_merged in q_merged: return 0.90
+
     qt = {t for t in q.split() if len(t)>1}
     ct = {t for t in c.split() if len(t)>1}
     if not qt or not ct: return 0.0
@@ -106,33 +114,55 @@ def fuzzy_score(query:str, candidate:str)->float:
     prefix_sc = sum(1 for qw in qt if any(cw.startswith(qw) or qw.startswith(cw) for cw in ct)) / max(len(qt),1)
     penalty   = min(len(ct-qt)*0.08, 0.30)
     def tri(s): return set(s[i:i+3] for i in range(len(s)-2))
-    tq,tc = tri(q),tri(c)
+    tq,tc = tri(q_merged),tri(c_merged)   # use merged for trigrams
     tri_sc = len(tq&tc)/max(len(tq|tc),1) if tq and tc else 0.0
-    return max(0.0, min(token_sc*0.55 + prefix_sc*0.25 + tri_sc*0.20 - penalty, 1.0))
+    return max(0.0, min(token_sc*0.45 + prefix_sc*0.20 + tri_sc*0.35 - penalty, 1.0))
 
 def find_company(client, name:str) -> Optional[Dict]:
     """Return {_id_obj, _id_str, name, voucher_count} for best matching company."""
     db = get_db(client)
-    # Load all companies (only 135 docs — fast)
     all_cos = list(db["ICompany"].find({}, {"_id":1,"name":1}))
     if not all_cos: return None
-    # Score all
+
+    # ── Pass 1: score all candidates with fuzzy ────────────────────────────
     scored = [(fuzzy_score(name, d.get("name","")), d) for d in all_cos]
     scored.sort(key=lambda x:-x[0])
     top = scored[:4]
-    print(f"[Fuzzy] '{name}' → {[(sc, d['name']) for sc,d in top[:3]]}")
+    print(f"[Fuzzy] '{name}' → {[(round(sc,3), d['name']) for sc,d in top[:3]]}")
     best_sc, best_doc = top[0]
-    if best_sc < 0.25: return None
+
+    # ── Pass 2: merged-substring fallback for joined words ─────────────────
+    # e.g. "namoeatimative" → strip all non-alpha → "namoeatimative"
+    #      vs "namo estimate" → "namoestimate"  trigram overlap catches it
+    if best_sc < 0.18:
+        q_clean = re.sub(r"[^a-z0-9]", "", normalize(name))
+        if len(q_clean) >= 5:
+            for d in all_cos:
+                c_clean = re.sub(r"[^a-z0-9]", "", normalize(d.get("name","")))
+                # substring match
+                if q_clean in c_clean or c_clean in q_clean:
+                    best_sc, best_doc = 0.85, d
+                    print(f"[Fuzzy-substring] '{name}' → '{d['name']}' via merged substring")
+                    break
+                # trigram on cleaned strings
+                def tri3(s): return set(s[i:i+3] for i in range(len(s)-2))
+                tq, tc = tri3(q_clean), tri3(c_clean)
+                sc = len(tq&tc)/max(len(tq|tc),1) if tq and tc else 0.0
+                if sc > best_sc:
+                    best_sc, best_doc = sc, d
+
+    if best_sc < 0.18:
+        return None
     obj_id = best_doc["_id"]
     str_id = str(obj_id)
-    # Probe which format Voucher uses
-    n_obj = db["Voucher"].count_documents({"iCompanyId": obj_id}, maxTimeMS=3000)
-    n_str = db["Voucher"].count_documents({"iCompanyId": str_id}, maxTimeMS=3000)
-    print(f"[Company] '{best_doc['name']}' → ObjectId:{n_obj}  string:{n_str}")
-    real_id = obj_id if n_obj >= n_str else str_id
-    total   = max(n_obj, n_str)
+    # Probe which format Voucher uses — try ALL voucher types
+    n_obj = db["Voucher"].count_documents({"iCompanyId": obj_id}, maxTimeMS=4000)
+    n_str = db["Voucher"].count_documents({"iCompanyId": str_id}, maxTimeMS=4000)
+    real_id   = obj_id if n_obj >= n_str else str_id
+    total_all = max(n_obj, n_str)
+    print(f"[Company] '{best_doc['name']}' ObjectId:{n_obj} string:{n_str} total_all:{total_all}")
     return {"_id_obj":obj_id, "_id_str":str_id, "real_id":real_id,
-            "name":best_doc["name"], "total_vouchers":total, "score":best_sc}
+            "name":best_doc["name"], "total_vouchers":total_all, "score":best_sc}
 
 def extract_company_name(q:str) -> Optional[str]:
     patterns = [
@@ -467,6 +497,132 @@ class MongoAIAgent:
             return plan("find","ICompany",fq={},proj={"_id":0,"name":1,"industry":1,"financialYear":1},
                         limit=200,tmpl="All companies.",ct="table",title="All Companies")
 
+        d = get_dates()
+
+        # Monthly sales trend (last 12 months)
+        if re.search(r"monthly.*trend|trend.*month|month.*sales|sales.*trend|last 12 month", q):
+            yrs = [d["ty"]-1, d["ty"]]
+            return plan("aggregate","ItemQuantityTracker",
+                pipe=[
+                    {"$match":{"voucherType":"sales","year":{"$in":yrs}}},
+                    {"$group":{"_id":{"year":"$year","month":"$month"},
+                               "amount":{"$sum":"$amount"},"qty":{"$sum":"$qty"}}},
+                    {"$sort":{"_id.year":1,"_id.month":1}},
+                    {"$project":{"_id":0,"year":"$_id.year","month":"$_id.month",
+                                 "amount":1,"qty":1}}
+                ],
+                tmpl="Monthly sales trend for last 12 months.",
+                ct="line",x="month",y="amount",title="Monthly Sales Trend")
+
+        # Total sales this year
+        if re.search(r"total.*revenue.*year|revenue.*this year|total.*sales.*year|sales.*this year|ytd", q):
+            return plan("aggregate","ItemQuantityTracker",
+                pipe=[
+                    {"$match":{"voucherType":"sales","year":d["ty"]}},
+                    {"$group":{"_id":None,"total_revenue":{"$sum":"$amount"},
+                               "total_qty":{"$sum":"$qty"}}},
+                    {"$project":{"_id":0,"total_revenue":1,"total_qty":1}}
+                ],
+                tmpl=f"Total sales revenue for {d['ty']}.",
+                ct="metric",y="total_revenue",title=f"Total Revenue {d['ty']}")
+
+        # Total sales last month
+        if re.search(r"sales.*last month|last month.*sales|revenue.*last month", q):
+            return plan("aggregate","ItemQuantityTracker",
+                pipe=[
+                    {"$match":{"voucherType":"sales","year":d["lm_year"],"month":d["lm_num"]}},
+                    {"$group":{"_id":None,"total_revenue":{"$sum":"$amount"},
+                               "total_qty":{"$sum":"$qty"}}},
+                    {"$project":{"_id":0,"total_revenue":1,"total_qty":1}}
+                ],
+                tmpl=f"Total sales for last month ({d['lm_num']}/{d['lm_year']}).",
+                ct="metric",y="total_revenue",
+                title=f"Sales - {calendar.month_abbr[d['lm_num']]} {d['lm_year']}")
+
+        # Total sales vs purchases
+        if re.search(r"sales.*vs.*purchase|purchase.*vs.*sales|compare.*sales|sales.*comparison", q):
+            return plan("aggregate","Voucher",
+                pipe=[
+                    {"$match":{"type":{"$in":["sales","purchase"]},
+                               "iCompanyId":{"$ne":None}}},
+                    {"$group":{"_id":"$type",
+                               "total":{"$sum":"$billFinalAmount"},
+                               "count":{"$sum":1}}},
+                    {"$project":{"_id":0,"type":"$_id","total":1,"count":1}}
+                ],
+                tmpl="Sales vs purchases comparison.",
+                ct="bar",x="type",y="total",title="Sales vs Purchases")
+
+        # Top customers
+        if re.search(r"top.*customer|best.*customer|customer.*revenue|customer.*sales", q) and hasnot("company","with","in"):
+            return plan("aggregate","Voucher",
+                pipe=[
+                    {"$match":{"type":"sales","iCompanyId":{"$ne":None},
+                               "party.name":{"$ne":None}}},
+                    {"$group":{"_id":"$party.name",
+                               "revenue":{"$sum":"$billFinalAmount"},
+                               "invoices":{"$sum":1}}},
+                    {"$sort":{"revenue":-1}},{"$limit":15},
+                    {"$project":{"_id":0,"customer":"$_id","revenue":1,"invoices":1}}
+                ],
+                tmpl="Top customers by revenue.",
+                ct="bar",x="customer",y="revenue",title="Top 15 Customers by Revenue")
+
+        # Top products
+        if re.search(r"top.*product|best.*product|most.*sold|product.*revenue|which product", q) and hasnot("company","with","in"):
+            return plan("aggregate","ItemQuantityTracker",
+                pipe=[
+                    {"$match":{"voucherType":"sales"}},
+                    {"$group":{"_id":"$itemId",
+                               "revenue":{"$sum":"$amount"},
+                               "qty":{"$sum":"$qty"}}},
+                    {"$sort":{"revenue":-1}},{"$limit":15},
+                    {"$project":{"_id":0,"item":"$_id","revenue":1,"qty":1}}
+                ],
+                tmpl="Top 15 products by revenue.",
+                ct="bar",x="item",y="revenue",title="Top Products by Revenue")
+
+        # Avg order value
+        if re.search(r"avg.*order|average.*order|order.*value|aov", q):
+            return plan("aggregate","Voucher",
+                pipe=[
+                    {"$match":{"type":"sales","iCompanyId":{"$ne":None}}},
+                    {"$group":{"_id":None,
+                               "avg_order_value":{"$avg":"$billFinalAmount"},
+                               "total_orders":{"$sum":1}}},
+                    {"$project":{"_id":0,"avg_order_value":1,"total_orders":1}}
+                ],
+                tmpl="Average order value.",
+                ct="metric",y="avg_order_value",title="Average Order Value")
+
+        # Unpaid invoices
+        if re.search(r"unpaid|outstanding|overdue|due amount", q):
+            return plan("find","Voucher",
+                fq={"status":"unpaid","iCompanyId":{"$ne":None}},
+                proj={"_id":0,"voucherNo":1,"billFinalAmount":1,
+                      "dueAmount":1,"issueDate":1,"status":1},
+                limit=50,tmpl="Unpaid invoices.",
+                ct="table",title="Unpaid Invoices")
+
+        # Stock / inventory
+        if re.search(r"stock|inventory|available.*qty|items.*stock", q):
+            return plan("find","Item",
+                fq={"isHidden":False,"availableQty":{"$gt":0}},
+                proj={"_id":0,"name":1,"skuBarcode":1,"availableQty":1,"unit":1},
+                limit=50,tmpl="Items with stock.",
+                ct="table",title="Inventory / Stock")
+
+        # Total purchases this year
+        if re.search(r"total.*purchase.*year|purchase.*this year", q):
+            return plan("aggregate","ItemQuantityTracker",
+                pipe=[
+                    {"$match":{"voucherType":"purchase","year":d["ty"]}},
+                    {"$group":{"_id":None,"total_purchases":{"$sum":"$amount"}}},
+                    {"$project":{"_id":0,"total_purchases":1}}
+                ],
+                tmpl=f"Total purchases for {d['ty']}.",
+                ct="metric",y="total_purchases",title=f"Total Purchases {d['ty']}")
+
         if re.match(r"^how many (customer|supplier)", q):
             rel = "customer" if "customer" in q else "supplier"
             field = f"total_{rel}s"
@@ -577,15 +733,38 @@ class MongoAIAgent:
     def _retry(self, question, orig, sys_p, usr_msg, dates):
         d = dates
         hint = f"""
-⚠️ RETRY — '{orig.get("collection")}' returned 0 results.
-Failed pipeline: {json.dumps(orig.get("pipeline"), default=str)[:200]}
+⚠️ RETRY — returned 0 results or had pipeline error.
+Failed: {json.dumps(orig.get("pipeline"), default=str)[:200]}
 
-Fixes:
-1. Use ItemQuantityTracker with integer year/month (most reliable for date queries):
-   this year:  {{"voucherType":"sales","year":{d['ty']}}}
-   last month: {{"voucherType":"sales","year":{d['lm_year']},"month":{d['lm_num']}}}
-2. Remove any iCompanyId filter ($ne null etc.)
-3. For sales vs purchases: group Voucher by "$type" with NO date filter
+CORRECT pipeline patterns (copy exactly):
+
+Monthly trend:
+[
+  {{"$match":{{"voucherType":"sales","year":{{"$in":[{d['ty']-1},{d['ty']}]}}}}}},
+  {{"$group":{{"_id":{{"year":"$year","month":"$month"}},"amount":{{"$sum":"$amount"}},"qty":{{"$sum":"$qty"}}}}}},
+  {{"$sort":{{"_id.year":1,"_id.month":1}}}},
+  {{"$project":{{"_id":0,"year":"$_id.year","month":"$_id.month","amount":1,"qty":1}}}}
+]
+
+Total this year:
+[
+  {{"$match":{{"voucherType":"sales","year":{d['ty']}}}}},
+  {{"$group":{{"_id":null,"total_revenue":{{"$sum":"$amount"}}}}}},
+  {{"$project":{{"_id":0,"total_revenue":1}}}}
+]
+
+Top customers (Voucher):
+[
+  {{"$match":{{"type":"sales","iCompanyId":{{"$ne":null}}}}}},
+  {{"$group":{{"_id":"$party.name","revenue":{{"$sum":"$billFinalAmount"}},"count":{{"$sum":1}}}}}},
+  {{"$sort":{{"revenue":-1}}}},{{"$limit":15}},
+  {{"$project":{{"_id":0,"customer":"$_id","revenue":1,"count":1}}}}
+]
+
+RULES: 
+- $group _id can be null or a field path like "$type"
+- $sum MUST be {{"$sum": "$fieldName"}} — NOT {{"$sum": "fieldName"}}
+- Every pipeline MUST end with $project that hides _id
 
 Question: {question}"""
         try:
@@ -602,13 +781,32 @@ Question: {question}"""
             return f"⚠️ **Database error:** `{db_error}`"
         if plan.get("query_type") == "none":
             return plan.get("answer_template","No data found.")
+
         if not results:
             if company:
-                return (f"**{company['name']}** was found in the database ✓\n\n"
-                        f"But there are **no records** matching this specific query "
-                        f"(company has {company['total_vouchers']:,} total vouchers).\n\n"
-                        f"Try: *sales vouchers, purchases, customers, monthly trend, revenue*")
+                total = company.get("total_vouchers", 0)
+                name  = company["name"]
+                score = company.get("score", 1.0)
+                matched = f"**{name}**" if score > 0.9 else f"**{name}** *(closest match to your query)*"
+                if total == 0:
+                    return (
+                        f"{matched} is registered in the database ✓ but has "
+                        f"**zero vouchers of any type** — this is a test/demo account "
+                        f"with no real transactions.\n\n"
+                        f"**Companies with real sales data you can query:**\n"
+                        f"• M/S DIPSHI - ESTIMATE → 40,255 sales vouchers\n"
+                        f"• HIRAKA JEWELS (NP) - ESTIMATE → 34,998 sales vouchers\n"
+                        f"• Bhakti Parshwanath → 30,707 sales vouchers\n"
+                        f"• NAMO-ESTIMATE → 27,478 sales vouchers\n"
+                        f"• VAIBHAV FASHION JEWELLERY → 11,735 sales vouchers"
+                    )
+                return (
+                    f"{matched} has **{total:,} total vouchers**, but none match "
+                    f"this specific filter.\n\nTry asking about: "
+                    f"*purchases, customers, monthly trend, revenue, unpaid invoices*"
+                )
             return "**No records found.** The query ran but matched zero documents."
+
         co = f" for **{company['name']}**" if company else ""
         prompt = (
             f"You are a precise data analyst for Invock ERP (India, ₹ INR).\n"
@@ -616,12 +814,13 @@ Question: {question}"""
             f"Company: {company['name'] if company else 'all companies'}\n\n"
             f"Data ({len(results)} records){co}:\n"
             f"{json.dumps(results[:10], default=str, indent=2)}\n\n"
-            f"RULES:\n"
+            f"STRICT RULES — violations will be flagged by the reviewer:\n"
             f"1. ONLY use numbers that appear in the data above — NEVER invent figures\n"
             f"2. State counts/totals precisely with ₹ crore/lakh formatting\n"
-            f"3. Name real top performers from the data\n"
-            f"4. Give 1 actionable insight based on real numbers only\n"
-            f"5. Keep to 3-4 sentences. No hallucination."
+            f"3. If data shows a count (like total_vouchers), lead with that exact number\n"
+            f"4. Name real top performers from the data with exact figures\n"
+            f"5. ONE actionable insight based on real numbers only\n"
+            f"6. Keep to 3 sentences max. No hallucination. No generic advice."
         )
         try: return self.llm.invoke([HumanMessage(content=prompt)]).content
         except: return f"Found {len(results)} record(s){co}."
@@ -654,3 +853,34 @@ Question: {question}"""
             return {"type":suggestion.get("type","bar"),"df":df,"x":x,"y":y,
                     "title":suggestion.get("title","Results")}
         except: return None
+
+# ── Company knowledge base (built from debug_all_companies.py output) ─────────
+# Maps company name → sales voucher count for instant context
+COMPANY_VOUCHER_COUNTS = {
+    "M/S DIPSHI - ESTIMATE": 40255,
+    "HIRAKA JEWELS (NP) - ESTIMATE": 34998,
+    "Bhakti Parshwanath": 30707,
+    "NAMO-ESTIMATE": 27478,
+    "DIPSHI CREATION PRIVATE LIMITED": 21350,
+    "VAIBHAV FASHION JEWELLERY": 11735,
+    "SHUBHAM JEWELLERY-Estimate": 9385,
+    "Old G.S. Est": 7879,
+    "KLITZ EST": 6759,
+    "KIRAN ENTERPRISE": 5022,
+    "SHUBH NX": 4086,
+    "SFJ Est": 2936,
+    "SANTOSH JEWELLERS": 823,
+    "Gsh": 693,
+    "SALONI FASHION JEWELLERY": 1712,
+    "Sanskriti": 1495,
+    "Santosh": 1306,
+    "HASU JEWELLERS": 1924,
+    "Web Enhancement UI": 444,
+    "Aman Demo Company": 913,
+    # Companies with 0 sales vouchers (test/empty accounts)
+    "NAMO SHIVAYA": 0,
+    "Shraddha Jewellery": 0,
+    "API Testing": 0,
+    "Aman/Invock": 0,
+    "HUSSAIN/CCC": 0,
+}
