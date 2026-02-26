@@ -138,7 +138,8 @@ def find_best_company(client, user_name: str) -> Optional[Dict]:
         {"name": {"$regex": f"^{re.escape(user_name)}$", "$options": "i"}},
         {"_id": 1, "name": 1})
     if doc:
-        return {"_id": str(doc["_id"]), "name": doc["name"], "score": 1.0}
+        return {"_id": str(doc["_id"]), "_id_obj": doc["_id"],
+                "name": doc["name"], "score": 1.0}
 
     # 2. Each word in query as a regex (catches "namo estimate" → "NAMO-ESTIMATE")
     words = [w for w in norm_query.split() if len(w) > 2]
@@ -151,7 +152,8 @@ def find_best_company(client, user_name: str) -> Optional[Dict]:
             best = max(docs, key=lambda d: fuzzy_score(user_name, d.get("name","")))
             sc = fuzzy_score(user_name, best.get("name",""))
             if sc >= 0.25:
-                return {"_id": str(best["_id"]), "name": best["name"], "score": sc}
+                return {"_id": str(best["_id"]), "_id_obj": best["_id"],
+                        "name": best["name"], "score": sc}
 
     # 3. Full fuzzy scan over all companies
     candidates = list(db["ICompany"].find({}, {"_id":1,"name":1}))
@@ -163,7 +165,12 @@ def find_best_company(client, user_name: str) -> Optional[Dict]:
 
     threshold = 0.20  # low enough to catch typo-heavy inputs like "eatimaye"→"estimate"
     if best_score >= threshold and best_doc:
-        return {"_id": str(best_doc["_id"]), "name": best_doc["name"], "score": best_score}
+        return {
+            "_id": str(best_doc["_id"]),
+            "_id_obj": best_doc["_id"],   # keep raw ObjectId too
+            "name": best_doc["name"],
+            "score": best_score
+        }
     return None
 
 def extract_company_name(question: str) -> Optional[str]:
@@ -528,13 +535,19 @@ class MongoAIAgent:
 
         # 4. Inject resolved company id into pipeline/query if available
         if resolved_company:
-            plan = self._inject_company_id(plan, resolved_company["_id"])
+            real_id = self._get_real_company_id(resolved_company)
+            resolved_company["real_id"] = real_id  # store for answer generation
+            plan = self._inject_company_id(plan, real_id)
 
         results, err = self._run(plan)
 
         # 5. Retry if empty
         if not results and not err and plan.get("query_type") != "none":
             results, err, plan = self._retry(question, plan, system_prompt, user_msg, dates, resolved_company)
+
+        # 6. Last resort: if company resolved but still no results, do a direct count
+        if not results and not err and resolved_company:
+            results, err, plan = self._direct_company_count(question, resolved_company)
 
         answer = self._honest_answer(question, plan, results, err, resolved_company)
         chart  = self._chart(results, plan.get("chart_suggestion",{}))
@@ -543,24 +556,137 @@ class MongoAIAgent:
         return {"type":"answer","answer":answer,"results":results,
                 "chart":chart,"plan":plan,"db_error":err}
 
-    def _inject_company_id(self, plan: Dict, company_id: str) -> Dict:
+    def _get_real_company_id(self, resolved: Dict) -> Any:
+        """
+        Find the actual iCompanyId value used in Voucher/Item collections.
+        ICompany._id might be ObjectId but Voucher.iCompanyId might be stored
+        as string, ObjectId, or even a different identifier.
+        We probe Voucher to find which format matches.
+        """
+        if not self.client or not resolved: return resolved.get("_id")
+        db = get_db(self.client)
+        obj_id  = resolved.get("_id_obj")   # raw ObjectId
+        str_id  = resolved.get("_id")       # string version
+
+        # Try string first (most common in modern MongoDB apps)
+        if str_id:
+            n = db["Voucher"].count_documents({"iCompanyId": str_id}, maxTimeMS=3000)
+            if n > 0:
+                print(f"[Agent] iCompanyId format: string '{str_id}' ({n} vouchers)")
+                return str_id
+
+        # Try ObjectId
+        if obj_id:
+            try:
+                n = db["Voucher"].count_documents({"iCompanyId": obj_id}, maxTimeMS=3000)
+                if n > 0:
+                    print(f"[Agent] iCompanyId format: ObjectId ({n} vouchers)")
+                    return obj_id
+            except: pass
+
+        # Try company_data as bridge (has name field and links to company)
+        try:
+            comp_data = db["company_data"].find_one(
+                {"name": {"$regex": re.escape(resolved["name"]), "$options": "i"}})
+            if comp_data:
+                # company_data might have an _id that matches iCompanyId
+                bridge_id = str(comp_data["_id"])
+                n = db["Voucher"].count_documents({"iCompanyId": bridge_id}, maxTimeMS=3000)
+                if n > 0:
+                    print(f"[Agent] iCompanyId via company_data bridge: '{bridge_id}' ({n} vouchers)")
+                    return bridge_id
+        except: pass
+
+        # Last resort: scan distinct iCompanyIds and fuzzy match
+        try:
+            ids = db["Voucher"].distinct("iCompanyId")
+            # check if any id is close to our str_id
+            for vid in ids:
+                if str(vid) == str_id:
+                    print(f"[Agent] iCompanyId matched via distinct scan: {vid!r}")
+                    return vid
+        except: pass
+
+        print(f"[Agent] WARNING: Could not find iCompanyId for '{resolved['name']}' in Voucher collection")
+        return str_id  # fall back to string anyway
+
+    def _inject_company_id(self, plan: Dict, company_id: Any) -> Dict:
         """Inject iCompanyId filter into pipeline $match or find_query."""
         try:
             if plan.get("query_type") == "aggregate" and plan.get("pipeline"):
                 pipe = plan["pipeline"]
-                # Find first $match and add iCompanyId
                 for stage in pipe:
                     if "$match" in stage:
                         stage["$match"]["iCompanyId"] = company_id
                         return plan
-                # No $match found — prepend one
-                plan["pipeline"] = [{"$match":{"iCompanyId":company_id}}] + pipe
+                plan["pipeline"] = [{"$match": {"iCompanyId": company_id}}] + pipe
             elif plan.get("query_type") == "find":
                 fq = plan.get("find_query") or {}
                 fq["iCompanyId"] = company_id
                 plan["find_query"] = fq
         except: pass
         return plan
+
+    def _direct_company_count(self, question: str, resolved_company: Dict):
+        """
+        Bypass LLM entirely — directly count/fetch Vouchers for this company.
+        Tries every possible iCompanyId format.
+        """
+        if not self.client: return [], None, {}
+        db = get_db(self.client)
+        q_lower = question.lower()
+
+        # Determine voucher type from question
+        if "sales" in q_lower:
+            v_filter = {"type": "sales"}
+            v_label = "sales"
+        elif "purchase" in q_lower:
+            v_filter = {"type": "purchase"}
+            v_label = "purchase"
+        else:
+            v_filter = {}
+            v_label = "all"
+
+        # Try every possible iCompanyId format
+        comp_name = resolved_company["name"]
+        obj_id    = resolved_company.get("_id_obj")
+        str_id    = resolved_company.get("_id","")
+
+        for cid in [str_id, obj_id]:
+            if cid is None: continue
+            try:
+                q = dict(v_filter)
+                q["iCompanyId"] = cid
+                count = db["Voucher"].count_documents(q, maxTimeMS=5000)
+                if count > 0:
+                    # Also get total amount
+                    pipeline = [
+                        {"$match": q},
+                        {"$group": {"_id": None,
+                                    "total_vouchers": {"$sum": 1},
+                                    "total_amount":   {"$sum": "$billFinalAmount"}}},
+                        {"$project": {"_id":0,"total_vouchers":1,"total_amount":1}}
+                    ]
+                    agg = list(db["Voucher"].aggregate(pipeline))
+                    plan = {
+                        "query_type": "aggregate", "collection": "Voucher",
+                        "pipeline": pipeline, "find_query": None,
+                        "answer_template": f"Count of {v_label} vouchers for {comp_name}.",
+                        "chart_suggestion": {"type":"metric","x_field":None,
+                                             "y_field":"total_vouchers",
+                                             "title":f"{comp_name} — {v_label.title()} Vouchers"},
+                        "clarification_needed": False
+                    }
+                    print(f"[Agent] Direct count: {count} {v_label} vouchers for '{comp_name}' (cid={cid!r})")
+                    return [deep_sanitize(r) for r in agg] if agg else [{"total_vouchers": count, "total_amount": 0}], None, plan
+            except Exception as e:
+                print(f"[Agent] Direct count error with cid={cid!r}: {e}")
+
+        # Nothing found even directly — company exists but has no vouchers
+        plan = {"query_type":"none","collection":"Voucher",
+                "answer_template":f"No {v_label} vouchers found for '{comp_name}'.",
+                "chart_suggestion":{"type":"none"},"clarification_needed":False}
+        return [], None, plan
 
     def _resolve_col(self, col):
         if col in VALID_COLS: return col
@@ -599,7 +725,8 @@ Question: {question}"""
             resp = self.llm.invoke([SystemMessage(content=system_prompt), HumanMessage(content=user_msg+hint)])
             plan2 = parse_json(resp.content)
             if resolved_company:
-                plan2 = self._inject_company_id(plan2, resolved_company["_id"])
+                real_id = resolved_company.get("real_id", resolved_company.get("_id"))
+                plan2 = self._inject_company_id(plan2, real_id)
             r, e = self._run(plan2)
             return r, e, plan2
         except Exception as e:
