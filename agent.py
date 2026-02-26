@@ -71,69 +71,64 @@ def get_collection_stats(client):
 # ── Fuzzy name resolver ────────────────────────────────────────────────────────
 
 def normalize(s: str) -> str:
-    """Lowercase, remove punctuation, collapse spaces."""
     s = s.lower().strip()
     s = re.sub(r"[^a-z0-9 ]", " ", s)
     return re.sub(r"\s+", " ", s).strip()
 
 def fuzzy_score(query: str, candidate: str) -> float:
     """
-    Multi-strategy similarity 0–1 between user query and a company name.
-    Handles typos, missing letters, word reordering.
+    Detailed similarity score 0–1.
+    Priority: exact > full-token-overlap > partial-token > trigram.
+    Crucially: "namo shivaya" must score higher against "NAMO SHIVAYA"
+    than against "NAMO-ESTIMATE".
     """
     q, c = normalize(query), normalize(candidate)
     if not q or not c: return 0.0
-    if q == c: return 1.0
-    if q in c or c in q: return 0.90
+    if q == c: return 1.0                        # exact
+    if q in c or c in q: return 0.92            # one contains the other
 
-    qt = set(q.split())
-    ct = set(c.split())
+    qt = [t for t in q.split() if len(t) > 1]  # keep order
+    ct = [t for t in c.split() if len(t) > 1]
+    qt_set, ct_set = set(qt), set(ct)
 
-    # remove very short stop tokens
-    qt = {t for t in qt if len(t) > 1}
-    ct = {t for t in ct if len(t) > 1}
-    if not qt or not ct: return 0.0
+    if not qt_set or not ct_set: return 0.0
 
-    # token overlap score
-    overlap = len(qt & ct)
-    token_score = overlap / max(len(qt), len(ct))
+    # ── Full token overlap (both tokens must match) ────────────────────────
+    exact_overlap = len(qt_set & ct_set)
+    token_score   = exact_overlap / max(len(qt_set), len(ct_set))
 
-    # prefix match bonus — e.g. "namo" matches "namo-estimate"
-    prefix_bonus = 0.0
-    for qw in qt:
-        for cw in ct:
+    # ── How many query tokens appear as prefix of candidate tokens ─────────
+    prefix_matches = 0
+    for qw in qt_set:
+        for cw in ct_set:
             if cw.startswith(qw) or qw.startswith(cw):
-                prefix_bonus = max(prefix_bonus, 0.25)
+                prefix_matches += 1; break
+    prefix_score = prefix_matches / max(len(qt_set), 1)
 
-    # substring bonus — each query token found anywhere in candidate
-    substr_bonus = 0.0
-    for qw in qt:
-        if qw in c:
-            substr_bonus += 0.15
-    substr_bonus = min(substr_bonus, 0.40)
+    # ── Penalty when candidate has many extra tokens (avoids false matches) ─
+    extra_tokens = len(ct_set - qt_set)
+    penalty = min(extra_tokens * 0.08, 0.30)
 
-    # character-level Jaccard on trigrams (catches typos like "eatimaye"→"estimate")
-    def trigrams(s):
-        return set(s[i:i+3] for i in range(len(s)-2))
-    tq, tc = trigrams(q), trigrams(c)
-    if tq and tc:
-        tri_score = len(tq & tc) / max(len(tq), len(tc))
-    else:
-        tri_score = 0.0
+    # ── Trigram similarity (catches typos like "eatimaye" → "estimate") ────
+    def tgrams(s): return set(s[i:i+3] for i in range(len(s) - 2))
+    tq, tc = tgrams(q), tgrams(c)
+    tri = len(tq & tc) / max(len(tq | tc), 1) if (tq and tc) else 0.0
 
-    combined = max(token_score + prefix_bonus + substr_bonus, tri_score * 0.8)
-    return min(combined, 1.0)
+    # Weighted combination — token match matters most
+    combined = (token_score * 0.55) + (prefix_score * 0.25) + (tri * 0.20) - penalty
+    return max(0.0, min(combined, 1.0))
 
 def find_best_company(client, user_name: str) -> Optional[Dict]:
     """
-    Find ICompany whose name best matches user_name.
-    Layers: exact → partial regex → fuzzy scoring with trigrams.
-    Returns {"_id": str, "name": str, "score": float} or None.
+    Find the ICompany that best matches user_name.
+    Always scores ALL candidates found by regex, returns the HIGHEST scorer.
+    Never returns a match below the confidence threshold.
     """
-    db = get_db(client)
-    norm_query = normalize(user_name)
+    db        = get_db(client)
+    norm_q    = normalize(user_name)
+    words     = [w for w in norm_q.split() if len(w) > 2]
 
-    # 1. Exact match (case-insensitive)
+    # 1. Exact case-insensitive match
     doc = db["ICompany"].find_one(
         {"name": {"$regex": f"^{re.escape(user_name)}$", "$options": "i"}},
         {"_id": 1, "name": 1})
@@ -141,36 +136,37 @@ def find_best_company(client, user_name: str) -> Optional[Dict]:
         return {"_id": str(doc["_id"]), "_id_obj": doc["_id"],
                 "name": doc["name"], "score": 1.0}
 
-    # 2. Each word in query as a regex (catches "namo estimate" → "NAMO-ESTIMATE")
-    words = [w for w in norm_query.split() if len(w) > 2]
+    # 2. Collect ALL candidates that contain ANY query word
+    candidate_set: Dict[str, dict] = {}   # deduplicate by _id string
     for word in words:
         docs = list(db["ICompany"].find(
             {"name": {"$regex": word, "$options": "i"}},
-            {"_id": 1, "name": 1}, limit=10))
-        if docs:
-            # score all and pick best
-            best = max(docs, key=lambda d: fuzzy_score(user_name, d.get("name","")))
-            sc = fuzzy_score(user_name, best.get("name",""))
-            if sc >= 0.25:
-                return {"_id": str(best["_id"]), "_id_obj": best["_id"],
-                        "name": best["name"], "score": sc}
+            {"_id": 1, "name": 1}))
+        for d in docs:
+            candidate_set[str(d["_id"])] = d
 
-    # 3. Full fuzzy scan over all companies
-    candidates = list(db["ICompany"].find({}, {"_id":1,"name":1}))
+    # 3. Also grab top-200 for full fuzzy scan (catches names with no word overlap)
+    all_docs = list(db["ICompany"].find({}, {"_id": 1, "name": 1}))
+    for d in all_docs:
+        candidate_set[str(d["_id"])] = d
+
+    # 4. Score every candidate and pick the best
     best_score, best_doc = 0.0, None
-    for c in candidates:
-        sc = fuzzy_score(user_name, c.get("name",""))
+    for d in candidate_set.values():
+        sc = fuzzy_score(user_name, d.get("name", ""))
         if sc > best_score:
-            best_score, best_doc = sc, c
+            best_score, best_doc = sc, d
 
-    threshold = 0.20  # low enough to catch typo-heavy inputs like "eatimaye"→"estimate"
+    # Debug: print top matches
+    top = sorted([(fuzzy_score(user_name, d.get("name","")), d.get("name",""))
+                  for d in candidate_set.values()], reverse=True)[:4]
+    print(f"[Fuzzy] '{user_name}' top matches: {top}")
+
+    # Require meaningful confidence — avoids false positives
+    threshold = 0.30
     if best_score >= threshold and best_doc:
-        return {
-            "_id": str(best_doc["_id"]),
-            "_id_obj": best_doc["_id"],   # keep raw ObjectId too
-            "name": best_doc["name"],
-            "score": best_score
-        }
+        return {"_id": str(best_doc["_id"]), "_id_obj": best_doc["_id"],
+                "name": best_doc["name"], "score": best_score}
     return None
 
 def extract_company_name(question: str) -> Optional[str]:
@@ -450,10 +446,15 @@ class MongoAIAgent:
                      proj={"_id":0,"name":1,"phone":1,"lastSignIn":1},
                      limit=500,template="All users.",ct="table",title="All Users")
 
-        if has("compan","companies") and hasnt("most voucher","sales","revenue"):
-            return p("find","ICompany",find_query={},
-                     proj={"_id":0,"name":1,"industry":1,"financialYear":1},
-                     limit=200,template="All companies.",ct="table",title="All Companies")
+        # Only shortcut to list ALL companies if no specific company name mentioned
+        if has("compan","companies") and hasnt("most voucher","sales","revenue","with","in","for","of"):
+            # make sure it's a generic "list companies" not "company with X"
+            generic = any(p in q for p in ["list compan","all compan","how many compan",
+                                            "show compan","compan list","compan count"])
+            if generic:
+                return p("find","ICompany",find_query={},
+                         proj={"_id":0,"name":1,"industry":1,"financialYear":1},
+                         limit=200,template="All companies.",ct="table",title="All Companies")
 
         if "how many customer" in q:
             return p("aggregate","Business",
@@ -558,57 +559,46 @@ class MongoAIAgent:
 
     def _get_real_company_id(self, resolved: Dict) -> Any:
         """
-        Find the actual iCompanyId value used in Voucher/Item collections.
-        ICompany._id might be ObjectId but Voucher.iCompanyId might be stored
-        as string, ObjectId, or even a different identifier.
-        We probe Voucher to find which format matches.
+        Return the iCompanyId value in the exact format Voucher collection uses.
+        Debug confirmed: Voucher.iCompanyId is stored as ObjectId (not string).
+        So we always prefer the raw ObjectId.
         """
         if not self.client or not resolved: return resolved.get("_id")
-        db = get_db(self.client)
-        obj_id  = resolved.get("_id_obj")   # raw ObjectId
-        str_id  = resolved.get("_id")       # string version
+        db    = get_db(self.client)
+        obj_id = resolved.get("_id_obj")   # raw ObjectId  ← this is what works
+        str_id = resolved.get("_id")       # string version
 
-        # Try string first (most common in modern MongoDB apps)
-        if str_id:
-            n = db["Voucher"].count_documents({"iCompanyId": str_id}, maxTimeMS=3000)
-            if n > 0:
-                print(f"[Agent] iCompanyId format: string '{str_id}' ({n} vouchers)")
-                return str_id
-
-        # Try ObjectId
+        # Try ObjectId first (confirmed format from debug_company.py)
         if obj_id:
             try:
                 n = db["Voucher"].count_documents({"iCompanyId": obj_id}, maxTimeMS=3000)
                 if n > 0:
-                    print(f"[Agent] iCompanyId format: ObjectId ({n} vouchers)")
+                    print(f"[Agent] iCompanyId=ObjectId, {n} vouchers for '{resolved['name']}'")
                     return obj_id
+            except Exception as e:
+                print(f"[Agent] ObjectId probe error: {e}")
+
+        # Fallback: string
+        if str_id:
+            try:
+                n = db["Voucher"].count_documents({"iCompanyId": str_id}, maxTimeMS=3000)
+                if n > 0:
+                    print(f"[Agent] iCompanyId=string, {n} vouchers for '{resolved['name']}'")
+                    return str_id
             except: pass
 
-        # Try company_data as bridge (has name field and links to company)
-        try:
-            comp_data = db["company_data"].find_one(
-                {"name": {"$regex": re.escape(resolved["name"]), "$options": "i"}})
-            if comp_data:
-                # company_data might have an _id that matches iCompanyId
-                bridge_id = str(comp_data["_id"])
-                n = db["Voucher"].count_documents({"iCompanyId": bridge_id}, maxTimeMS=3000)
-                if n > 0:
-                    print(f"[Agent] iCompanyId via company_data bridge: '{bridge_id}' ({n} vouchers)")
-                    return bridge_id
-        except: pass
-
-        # Last resort: scan distinct iCompanyIds and fuzzy match
+        # Last resort: scan distinct and find exact match
         try:
             ids = db["Voucher"].distinct("iCompanyId")
-            # check if any id is close to our str_id
             for vid in ids:
                 if str(vid) == str_id:
-                    print(f"[Agent] iCompanyId matched via distinct scan: {vid!r}")
+                    print(f"[Agent] iCompanyId found via scan: {vid!r} for '{resolved['name']}'")
                     return vid
         except: pass
 
-        print(f"[Agent] WARNING: Could not find iCompanyId for '{resolved['name']}' in Voucher collection")
-        return str_id  # fall back to string anyway
+        # Return ObjectId anyway (best guess)
+        print(f"[Agent] WARNING: falling back to ObjectId for '{resolved['name']}'")
+        return obj_id or str_id
 
     def _inject_company_id(self, plan: Dict, company_id: Any) -> Dict:
         """Inject iCompanyId filter into pipeline $match or find_query."""
@@ -647,19 +637,18 @@ class MongoAIAgent:
             v_filter = {}
             v_label = "all"
 
-        # Try every possible iCompanyId format
+        # Try ObjectId first (confirmed by debug_company.py output), then string
+        obj_id = resolved_company.get("_id_obj")
+        str_id = resolved_company.get("real_id") or resolved_company.get("_id", "")
         comp_name = resolved_company["name"]
-        obj_id    = resolved_company.get("_id_obj")
-        str_id    = resolved_company.get("_id","")
+        id_candidates = [c for c in [obj_id, str_id] if c is not None]
 
-        for cid in [str_id, obj_id]:
-            if cid is None: continue
+        for cid in id_candidates:
             try:
                 q = dict(v_filter)
                 q["iCompanyId"] = cid
                 count = db["Voucher"].count_documents(q, maxTimeMS=5000)
                 if count > 0:
-                    # Also get total amount
                     pipeline = [
                         {"$match": q},
                         {"$group": {"_id": None,
@@ -668,7 +657,7 @@ class MongoAIAgent:
                         {"$project": {"_id":0,"total_vouchers":1,"total_amount":1}}
                     ]
                     agg = list(db["Voucher"].aggregate(pipeline))
-                    plan = {
+                    result_plan = {
                         "query_type": "aggregate", "collection": "Voucher",
                         "pipeline": pipeline, "find_query": None,
                         "answer_template": f"Count of {v_label} vouchers for {comp_name}.",
@@ -678,15 +667,18 @@ class MongoAIAgent:
                         "clarification_needed": False
                     }
                     print(f"[Agent] Direct count: {count} {v_label} vouchers for '{comp_name}' (cid={cid!r})")
-                    return [deep_sanitize(r) for r in agg] if agg else [{"total_vouchers": count, "total_amount": 0}], None, plan
+                    return ([deep_sanitize(r) for r in agg]
+                            if agg else [{"total_vouchers": count, "total_amount": 0}]), None, result_plan
             except Exception as e:
                 print(f"[Agent] Direct count error with cid={cid!r}: {e}")
 
-        # Nothing found even directly — company exists but has no vouchers
-        plan = {"query_type":"none","collection":"Voucher",
-                "answer_template":f"No {v_label} vouchers found for '{comp_name}'.",
-                "chart_suggestion":{"type":"none"},"clarification_needed":False}
-        return [], None, plan
+        # Nothing found — company exists but genuinely has no vouchers of this type
+        result_plan = {
+            "query_type": "none", "collection": "Voucher",
+            "answer_template": f"No {v_label} vouchers for '{comp_name}'.",
+            "chart_suggestion": {"type":"none"}, "clarification_needed": False
+        }
+        return [], None, result_plan
 
     def _resolve_col(self, col):
         if col in VALID_COLS: return col
@@ -741,14 +733,17 @@ Question: {question}"""
             return plan.get("answer_template","I couldn't find relevant data for that question.")
 
         if not results:
-            company_hint = ""
             if resolved_company:
-                company_hint = f" (searched in company: **{resolved_company['name']}**)"
+                return (
+                    f"**{resolved_company['name']}** was found in the database ✓, "
+                    f"but has **no matching records** for this query.\n\n"
+                    f"This company may be a test/demo account, or it may not have "
+                    f"any transactions of this type recorded yet."
+                )
             return (
-                f"**No records found{company_hint}.**\n\n"
+                f"**No records found.**\n\n"
                 f"The query ran successfully but matched zero documents. "
-                f"This likely means no data exists for the given filters or time period. "
-                f"Try adjusting your question or check if the company/date range has data."
+                f"Try adjusting your filters or check if data exists for this period."
             )
 
         # Build honest, grounded analysis
