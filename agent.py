@@ -1,10 +1,10 @@
 """
-MongoDB AI Agent - Production Grade
-Database: dev-cluster (Invock ERP)
+MongoDB AI Agent — Invock ERP
+Robust direct-query approach for company-specific questions.
 """
-import os, json, re
+import os, json, re, calendar
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 from bson import ObjectId
 import pandas as pd
 from pymongo import MongoClient
@@ -17,400 +17,418 @@ load_dotenv()
 MONGODB_URI = os.getenv("MONGODB_URI","mongodb+srv://mcpaccess:mcpaccess@dev6.4hksq.mongodb.net/dev-cluster")
 DB_NAME = "dev-cluster"
 
-# ── MongoDB helpers ────────────────────────────────────────────────────────────
+# ─────────────────────────────── MongoDB helpers ──────────────────────────────
 
 def get_mongo_client():
     try:
         c = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=10000)
-        c.admin.command("ping")
-        return c
+        c.admin.command("ping"); return c
     except Exception as e:
-        print(f"[MongoDB] {e}")
-        return None
+        print(f"[MongoDB] {e}"); return None
 
 def get_db(client): return client[DB_NAME]
 
 def deep_sanitize(obj):
-    if isinstance(obj, dict):    return {k: deep_sanitize(v) for k, v in obj.items()}
+    if isinstance(obj, dict):    return {k: deep_sanitize(v) for k,v in obj.items()}
     if isinstance(obj, list):    return [deep_sanitize(i) for i in obj]
-    if isinstance(obj, ObjectId): return str(obj)
-    if isinstance(obj, datetime): return obj.strftime("%Y-%m-%d %H:%M:%S")
+    if isinstance(obj, ObjectId):  return str(obj)
+    if isinstance(obj, datetime):  return obj.strftime("%Y-%m-%d %H:%M:%S")
     if isinstance(obj, float) and obj != obj: return None
-    if isinstance(obj, (str, int, float, bool, type(None))): return obj
+    if isinstance(obj, (str,int,float,bool,type(None))): return obj
     return str(obj)
 
-def execute_agg(client, col, pipeline):
-    try:
-        raw = list(get_db(client)[col].aggregate(pipeline, allowDiskUse=True))
-        return [deep_sanitize(d) for d in raw], None
-    except Exception as e:
-        return [], str(e)
+def run_agg(db, col, pipeline):
+    raw = list(db[col].aggregate(pipeline, allowDiskUse=True))
+    return [deep_sanitize(d) for d in raw]
 
-def execute_find(client, col, query, proj=None, limit=50):
-    try:
-        raw = list(get_db(client)[col].find(query, proj or {"_id":0}).limit(limit))
-        return [deep_sanitize(d) for d in raw], None
-    except Exception as e:
-        return [], str(e)
+def run_find(db, col, query, proj=None, limit=100, sort=None):
+    cur = db[col].find(query, proj or {"_id":0})
+    if sort: cur = cur.sort(sort)
+    return [deep_sanitize(d) for d in cur.limit(limit)]
 
 def detect_date_type(client) -> str:
     try:
         s = get_db(client)["Voucher"].find_one({"type":"sales"},{"_id":0,"issueDate":1})
         if s: return "date_object" if isinstance(s.get("issueDate"), datetime) else "string"
     except: pass
-    return "string"
+    return "date_object"
 
 def get_collection_stats(client):
     stats = {}
-    for col in ["Voucher","Item","Business","ItemQuantityTracker","ItemSummary",
+    for col in ["Voucher","Item","Business","ItemQuantityTracker",
                 "Contact","Account","IUser","IBranch","ICompany"]:
         try: stats[col] = get_db(client)[col].count_documents({})
         except: stats[col] = 0
     return stats
 
-# ── Fuzzy name resolver ────────────────────────────────────────────────────────
-
-def normalize(s: str) -> str:
-    s = s.lower().strip()
-    s = re.sub(r"[^a-z0-9 ]", " ", s)
-    return re.sub(r"\s+", " ", s).strip()
-
-def fuzzy_score(query: str, candidate: str) -> float:
-    """
-    Detailed similarity score 0–1.
-    Priority: exact > full-token-overlap > partial-token > trigram.
-    Crucially: "namo shivaya" must score higher against "NAMO SHIVAYA"
-    than against "NAMO-ESTIMATE".
-    """
-    q, c = normalize(query), normalize(candidate)
-    if not q or not c: return 0.0
-    if q == c: return 1.0                        # exact
-    if q in c or c in q: return 0.92            # one contains the other
-
-    qt = [t for t in q.split() if len(t) > 1]  # keep order
-    ct = [t for t in c.split() if len(t) > 1]
-    qt_set, ct_set = set(qt), set(ct)
-
-    if not qt_set or not ct_set: return 0.0
-
-    # ── Full token overlap (both tokens must match) ────────────────────────
-    exact_overlap = len(qt_set & ct_set)
-    token_score   = exact_overlap / max(len(qt_set), len(ct_set))
-
-    # ── How many query tokens appear as prefix of candidate tokens ─────────
-    prefix_matches = 0
-    for qw in qt_set:
-        for cw in ct_set:
-            if cw.startswith(qw) or qw.startswith(cw):
-                prefix_matches += 1; break
-    prefix_score = prefix_matches / max(len(qt_set), 1)
-
-    # ── Penalty when candidate has many extra tokens (avoids false matches) ─
-    extra_tokens = len(ct_set - qt_set)
-    penalty = min(extra_tokens * 0.08, 0.30)
-
-    # ── Trigram similarity (catches typos like "eatimaye" → "estimate") ────
-    def tgrams(s): return set(s[i:i+3] for i in range(len(s) - 2))
-    tq, tc = tgrams(q), tgrams(c)
-    tri = len(tq & tc) / max(len(tq | tc), 1) if (tq and tc) else 0.0
-
-    # Weighted combination — token match matters most
-    combined = (token_score * 0.55) + (prefix_score * 0.25) + (tri * 0.20) - penalty
-    return max(0.0, min(combined, 1.0))
-
-def find_best_company(client, user_name: str) -> Optional[Dict]:
-    """
-    Find the ICompany that best matches user_name.
-    Always scores ALL candidates found by regex, returns the HIGHEST scorer.
-    Never returns a match below the confidence threshold.
-    """
-    db        = get_db(client)
-    norm_q    = normalize(user_name)
-    words     = [w for w in norm_q.split() if len(w) > 2]
-
-    # 1. Exact case-insensitive match
-    doc = db["ICompany"].find_one(
-        {"name": {"$regex": f"^{re.escape(user_name)}$", "$options": "i"}},
-        {"_id": 1, "name": 1})
-    if doc:
-        return {"_id": str(doc["_id"]), "_id_obj": doc["_id"],
-                "name": doc["name"], "score": 1.0}
-
-    # 2. Collect ALL candidates that contain ANY query word
-    candidate_set: Dict[str, dict] = {}   # deduplicate by _id string
-    for word in words:
-        docs = list(db["ICompany"].find(
-            {"name": {"$regex": word, "$options": "i"}},
-            {"_id": 1, "name": 1}))
-        for d in docs:
-            candidate_set[str(d["_id"])] = d
-
-    # 3. Also grab top-200 for full fuzzy scan (catches names with no word overlap)
-    all_docs = list(db["ICompany"].find({}, {"_id": 1, "name": 1}))
-    for d in all_docs:
-        candidate_set[str(d["_id"])] = d
-
-    # 4. Score every candidate and pick the best
-    best_score, best_doc = 0.0, None
-    for d in candidate_set.values():
-        sc = fuzzy_score(user_name, d.get("name", ""))
-        if sc > best_score:
-            best_score, best_doc = sc, d
-
-    # Debug: print top matches
-    top = sorted([(fuzzy_score(user_name, d.get("name","")), d.get("name",""))
-                  for d in candidate_set.values()], reverse=True)[:4]
-    print(f"[Fuzzy] '{user_name}' top matches: {top}")
-
-    # Require meaningful confidence — avoids false positives
-    threshold = 0.30
-    if best_score >= threshold and best_doc:
-        return {"_id": str(best_doc["_id"]), "_id_obj": best_doc["_id"],
-                "name": best_doc["name"], "score": best_score}
-    return None
-
-def extract_company_name(question: str) -> Optional[str]:
-    """
-    Extract a company/org name from the question.
-    Handles patterns like:
-      'in company Namo eatimaye'  → 'Namo eatimaye'
-      'company with Namo eatimaye' → 'Namo eatimaye'
-      'for NAMO SHIVAYA'          → 'NAMO SHIVAYA'
-      'vouchers of XYZ Ltd'       → 'XYZ Ltd'
-    """
-    # Strip question words that confuse the pattern
-    q = question.strip()
-
-    patterns = [
-        # "company with/named/called X"
-        r"company\s+(?:with|named?|called?|of)?\s+['\"]?([A-Za-z0-9][A-Za-z0-9 /\-&.]{2,}?)['\"]?(?:\s*\?|$|\.|,)",
-        # "in/for/of company X"
-        r"(?:in|for|of)\s+company\s+['\"]?([A-Za-z0-9][A-Za-z0-9 /\-&.]{2,}?)['\"]?(?:\s*\?|$|\.|,)",
-        # "in/with/for X company"
-        r"(?:in|with|for)\s+['\"]?([A-Za-z0-9][A-Za-z0-9 /\-&.]{2,}?)['\"]?\s+company(?:\s*\?|$|\.|,)?",
-        # "vouchers/sales/records in/of X"
-        r"(?:vouchers?|sales?|records?|items?|purchases?)\s+(?:in|of|for)\s+['\"]?([A-Za-z0-9][A-Za-z0-9 /\-&.]{2,}?)['\"]?(?:\s*\?|$|\.|,)",
-        # "X company has/have/contains"
-        r"['\"]?([A-Za-z0-9][A-Za-z0-9 /\-&.]{2,}?)['\"]?\s+(?:company|org|organisation|organization)",
-    ]
-    for pat in patterns:
-        m = re.search(pat, q, re.IGNORECASE)
-        if m:
-            name = m.group(1).strip()
-            # strip trailing noise words
-            name = re.sub(r'\s*(company|the|a|an|in|for|of|with|has|have)\s*$',
-                          '', name, flags=re.I).strip()
-            if len(name) >= 3:
-                return name
-    return None
-
-# ── Date helpers ───────────────────────────────────────────────────────────────
+# ─────────────────────────── Date helpers ─────────────────────────────────────
 
 def get_dates():
     now = datetime.utcnow()
-    fm  = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    fm  = now.replace(day=1,hour=0,minute=0,second=0,microsecond=0)
     lme = fm - timedelta(seconds=1)
-    lms = lme.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-    ys  = now.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
+    lms = lme.replace(day=1,hour=0,minute=0,second=0,microsecond=0)
+    ys  = now.replace(month=1,day=1,hour=0,minute=0,second=0,microsecond=0)
     return {
-        "now": now, "year_start": ys,
-        "last_month_start": lms, "last_month_end": lme,
-        "this_month_start": fm,
-        "today_start": now.replace(hour=0, minute=0, second=0, microsecond=0),
-        "last_12m_start": now - timedelta(days=365),
-        "lm_num": lme.month, "lm_year": lme.year,
-        "tm_num": now.month, "ty": now.year,
+        "now":now,"year_start":ys,"last_month_start":lms,"last_month_end":lme,
+        "this_month_start":fm,
+        "today_start":now.replace(hour=0,minute=0,second=0,microsecond=0),
+        "last_12m_start":now-timedelta(days=365),
+        "lm_num":lme.month,"lm_year":lme.year,"tm_num":now.month,"ty":now.year,
     }
 
-def convert_dt_strings(obj):
-    if isinstance(obj, dict):  return {k: convert_dt_strings(v) for k, v in obj.items()}
-    if isinstance(obj, list):  return [convert_dt_strings(i) for i in obj]
+def dt_str_to_obj(obj):
+    """Recursively convert ISO date strings to datetime objects in a pipeline."""
+    if isinstance(obj, dict):  return {k: dt_str_to_obj(v) for k,v in obj.items()}
+    if isinstance(obj, list):  return [dt_str_to_obj(i) for i in obj]
     if isinstance(obj, str):
         for fmt in ["%Y-%m-%dT%H:%M:%S","%Y-%m-%d %H:%M:%S","%Y-%m-%d"]:
             try: return datetime.strptime(obj, fmt)
             except: pass
     return obj
 
-# ── LLM ───────────────────────────────────────────────────────────────────────
+# ─────────────────────────── Company fuzzy match ───────────────────────────────
+
+def normalize(s:str)->str:
+    s = s.lower().strip()
+    s = re.sub(r"[^a-z0-9 ]"," ",s)
+    return re.sub(r"\s+"," ",s).strip()
+
+def fuzzy_score(query:str, candidate:str)->float:
+    q,c = normalize(query), normalize(candidate)
+    if not q or not c: return 0.0
+    if q == c: return 1.0
+    if q in c or c in q: return 0.92
+    qt = {t for t in q.split() if len(t)>1}
+    ct = {t for t in c.split() if len(t)>1}
+    if not qt or not ct: return 0.0
+    token_sc  = len(qt&ct) / max(len(qt),len(ct))
+    prefix_sc = sum(1 for qw in qt if any(cw.startswith(qw) or qw.startswith(cw) for cw in ct)) / max(len(qt),1)
+    penalty   = min(len(ct-qt)*0.08, 0.30)
+    def tri(s): return set(s[i:i+3] for i in range(len(s)-2))
+    tq,tc = tri(q),tri(c)
+    tri_sc = len(tq&tc)/max(len(tq|tc),1) if tq and tc else 0.0
+    return max(0.0, min(token_sc*0.55 + prefix_sc*0.25 + tri_sc*0.20 - penalty, 1.0))
+
+def find_company(client, name:str) -> Optional[Dict]:
+    """Return {_id_obj, _id_str, name, voucher_count} for best matching company."""
+    db = get_db(client)
+    # Load all companies (only 135 docs — fast)
+    all_cos = list(db["ICompany"].find({}, {"_id":1,"name":1}))
+    if not all_cos: return None
+    # Score all
+    scored = [(fuzzy_score(name, d.get("name","")), d) for d in all_cos]
+    scored.sort(key=lambda x:-x[0])
+    top = scored[:4]
+    print(f"[Fuzzy] '{name}' → {[(sc, d['name']) for sc,d in top[:3]]}")
+    best_sc, best_doc = top[0]
+    if best_sc < 0.25: return None
+    obj_id = best_doc["_id"]
+    str_id = str(obj_id)
+    # Probe which format Voucher uses
+    n_obj = db["Voucher"].count_documents({"iCompanyId": obj_id}, maxTimeMS=3000)
+    n_str = db["Voucher"].count_documents({"iCompanyId": str_id}, maxTimeMS=3000)
+    print(f"[Company] '{best_doc['name']}' → ObjectId:{n_obj}  string:{n_str}")
+    real_id = obj_id if n_obj >= n_str else str_id
+    total   = max(n_obj, n_str)
+    return {"_id_obj":obj_id, "_id_str":str_id, "real_id":real_id,
+            "name":best_doc["name"], "total_vouchers":total, "score":best_sc}
+
+def extract_company_name(q:str) -> Optional[str]:
+    patterns = [
+        r"company\s+(?:with|named?|called?|of)?\s*['\"]?([A-Za-z0-9][A-Za-z0-9 /\-&.]{2,40}?)['\"]?(?:\s*\?|$|\.|,)",
+        r"(?:in|for|of)\s+company\s+['\"]?([A-Za-z0-9][A-Za-z0-9 /\-&.]{2,40}?)['\"]?(?:\s*\?|$|\.|,)",
+        r"(?:in|with|for)\s+['\"]?([A-Za-z0-9][A-Za-z0-9 /\-&.]{2,40}?)['\"]?\s+company(?:\s*\?|$|\.|,)?",
+        r"(?:vouchers?|sales?|records?|items?|purchases?|data)\s+(?:in|of|for)\s+['\"]?([A-Za-z0-9][A-Za-z0-9 /\-&.]{2,40}?)['\"]?(?:\s*\?|$|\.|,)",
+    ]
+    for pat in patterns:
+        m = re.search(pat, q, re.IGNORECASE)
+        if m:
+            name = re.sub(r'\s*(company|the|a|an|in|for|of|with|has|have)\s*$','',m.group(1).strip(),flags=re.I).strip()
+            if len(name)>=3: return name
+    return None
+
+# ─────────────────────────── LLM ──────────────────────────────────────────────
 
 def get_llm():
     k = os.getenv("GROQ_API_KEY")
     if not k: raise ValueError("GROQ_API_KEY not set")
     return ChatGroq(model="llama-3.3-70b-versatile", groq_api_key=k, temperature=0)
 
-# ── Schema ────────────────────────────────────────────────────────────────────
+# ─────────────────────────── Valid collections ────────────────────────────────
+
+VALID_COLS = {
+    "Voucher","Item","Business","ItemQuantityTracker","ItemSummary","Contact",
+    "Account","IBranch","IUser","ICompany","ItemGroup","company_data",
+    "voucher_count","AccountGroup",
+}
+
+# ─────────────────────────── Schema for LLM ───────────────────────────────────
 
 SCHEMA = """
-DATABASE: dev-cluster — Invock ERP (Jewellery, India, ₹ INR)
+DATABASE: dev-cluster — Invock ERP (Jewellery/textiles, India, ₹ INR)
 
-══ Voucher (1,317,598 docs)
+═══ Voucher (1.3M docs) — every financial transaction
   type              "sales"|"purchase"|"receipt"|"payment"|"credit note"|"debit note"|"journal"
-  voucherNo         string
-  issueDate         DATE OBJECT
-  billFinalAmount   float  ← revenue total
-  billItemsPrice    float
+  billFinalAmount   float  — total invoice ₹
+  billItemsPrice    float  — subtotal
   billTaxAmount     float
-  billDiscountAmount float
-  dueAmount         float
+  dueAmount         float  — outstanding
   paidAmount        float
   status            "unpaid"|"paid"|"partial"
-  iCompanyId        string  ← COMPANY FILTER KEY
-  iBranchId         string
+  iCompanyId        ObjectId  — ALWAYS filter as ObjectId (not string)
+  iBranchId         ObjectId
+  issueDate         Date object
   lineItemQtySum    float
-  party.name        string
+  party.name        string  — customer/supplier name
+  SAFE projection: {_id:0,type:1,voucherNo:1,issueDate:1,billFinalAmount:1,
+    billTaxAmount:1,status:1,dueAmount:1,paidAmount:1,iCompanyId:1,lineItemQtySum:1}
+  NEVER project: itemList,transactions,tax,voucherList,otherCharges,party
 
-  SAFE find projection: {"_id":0,"type":1,"voucherNo":1,"issueDate":1,"billFinalAmount":1,
-   "billTaxAmount":1,"status":1,"dueAmount":1,"paidAmount":1,"iCompanyId":1,"lineItemQtySum":1}
-  NEVER include: itemList,transactions,tax,voucherList,otherCharges,party
-
-══ ItemQuantityTracker (2,135,362 docs) ← BEST for date/product analytics
+═══ ItemQuantityTracker (2.1M docs) — BEST for date/product analytics
   voucherType  "sales"|"purchase"|"stock_adjustment"
-  month        float  1-12
-  year         int
-  itemId       string
-  qty          float
-  amount       float
-  iCompanyId   string
+  month  float 1-12,  year  int,  itemId  string
+  qty  float,  amount  float,  iCompanyId  ObjectId
 
-══ Item (450,407 docs)
-  name, skuBarcode, itemCode  string
-  unit  "pcs"|"gm"
-  unitPurchasePrice, unitSellWholeSalePrice, unitSellRetailPrice  float
-  availableQty  float
-  iCompanyId, iBranchId  string
-  isHidden, isService  boolean
+═══ Item (450K)  name,skuBarcode,availableQty,unit,iCompanyId,isHidden
+═══ Business (45K)  name,relationType("customer"|"supplier"|"both"),city,state,iCompanyId
+═══ IBranch (264)  name,city,state,code,iCompanyId
+═══ IUser (399)  name,phone,lastSignIn
+═══ ICompany (135)  name,industry,financialYear
+═══ ItemGroup (1.8K)  name,taxPercentage,hsn
+═══ voucher_count (720K)  vouchercount int, iCompanyId ObjectId
+═══ Account (51K)  name,accountGroupName,balance,iCompanyId
 
-══ Business (45,119 docs)
-  name, aliasName  string
-  relationType  "customer"|"supplier"|"both"
-  city, state  string
-  iCompanyId   string
-
-══ ICompany (135 docs)
-  name  string  ← company name
-  industry  string
-  financialYear  string
-  _id  ObjectId  ← use str(_id) as iCompanyId filter in other collections
-
-══ IBranch(264)  name,city,state,code,iCompanyId
-══ IUser(399)    name,phone,lastSignIn
-══ ItemGroup(1.8K) name,taxPercentage,hsn
-══ voucher_count(720K) vouchercount int, iCompanyId string
-══ company_data(48) name,items,business,user,expiryDate
-══ ItemSummary(147K) type,issueDateMonth,issueDateYr,itemId,amount,qty,iCompanyId
-
-══ QUESTION → COLLECTION MAP:
-  total sales              → Voucher, type="sales", $sum billFinalAmount
-  total purchases          → Voucher, type="purchase", $sum billFinalAmount
-  sales vs purchases       → Voucher, group "$type", $sum billFinalAmount → bar
-  top products qty         → ItemQuantityTracker, voucherType="sales", group itemId, $sum qty
-  top products revenue     → ItemQuantityTracker, voucherType="sales", group itemId, $sum amount
-  monthly trend            → ItemQuantityTracker, voucherType="sales", group {year,month}, $sum amount
-  top customers            → Voucher, type="sales", group "$party.name", $sum billFinalAmount
-  count customers          → Business, relationType="customer", $count
-  avg order value          → Voucher, type="sales", $avg billFinalAmount
-  unpaid invoices          → Voucher, find status="unpaid", SAFE PROJECTION
-  stock/inventory          → Item, isHidden=false, sort availableQty desc
-  branches                 → IBranch, find all
-  users                    → IUser, find all
-  companies                → ICompany, find all
-  vouchers IN A COMPANY    → Voucher, filter iCompanyId="<resolved_id>", SAFE PROJECTION or count
-  sales last month         → ItemQuantityTracker, year=LM_YEAR, month=LM_NUM, $sum amount
-  revenue this year        → ItemQuantityTracker, year=TY, $sum amount
-  trend 12 months          → ItemQuantityTracker, year in [TY-1,TY], group {year,month}, $sum amount
+═══ QUESTION → PIPELINE MAP (follow exactly):
+  total sales           → Voucher agg: $match{type:"sales"}, $group{_id:null,$sum:billFinalAmount}, $project{_id:0,total_sales:1}
+  total purchases       → Voucher agg: $match{type:"purchase"}, $group, $project{total_purchases:1}
+  sales vs purchases    → Voucher agg: $match{type:{$in:["sales","purchase"]}}, $group{_id:"$type",$sum:billFinalAmount}, $project{_id:0,type:"$_id",amount:1}
+  top products qty      → ItemQuantityTracker: $match{voucherType:"sales"}, $group{_id:"$itemId",$sum:"$qty"}, sort desc, $project{_id:0,item:"$_id",total_qty:1}
+  top products revenue  → ItemQuantityTracker: $match{voucherType:"sales"}, $group{_id:"$itemId",$sum:"$amount"}, sort desc, $project{_id:0,item:"$_id",revenue:1}
+  monthly trend         → ItemQuantityTracker: $match{voucherType:"sales"}, $group{_id:{year:"$year",month:"$month"},$sum:"$amount"}, sort {_id:1}, $project{_id:0,year:"$_id.year",month:"$_id.month",amount:1}
+  top customers         → Voucher: $match{type:"sales"}, $group{_id:"$party.name",$sum:"$billFinalAmount"}, sort desc, $project{_id:0,customer:"$_id",revenue:1}
+  count customers       → Business: $match{relationType:"customer"}, $count → "customer_count"
+  avg order value       → Voucher: $match{type:"sales"}, $group{_id:null,$avg:"$billFinalAmount"}, $project{_id:0,avg_order_value:1}
+  unpaid invoices       → Voucher: find{status:"unpaid"}, SAFE PROJECTION, limit 50
+  stock/inventory       → Item: find{isHidden:false}, sort{availableQty:-1}, projection{_id:0,name:1,skuBarcode:1,availableQty:1,unit:1}
+  branches              → IBranch: find{}, projection{_id:0,name:1,city:1,state:1,code:1}
+  users                 → IUser: find{}, projection{_id:0,name:1,phone:1,lastSignIn:1}
+  companies             → ICompany: find{}, projection{_id:0,name:1,industry:1,financialYear:1}
+  sales this year       → ItemQuantityTracker: $match{voucherType:"sales",year:TY}, $group, $sum amount
+  sales last month      → ItemQuantityTracker: $match{voucherType:"sales",year:LM_YEAR,month:LM_NUM}, $group, $sum amount
+  trend 12 months       → ItemQuantityTracker: $match{voucherType:"sales",year:{$in:[TY-1,TY]}}, group by year+month
 """
 
-def build_prompt(dates, date_type, company_context=""):
+def build_prompt(dates, date_type):
     d = dates
-    lms = d["last_month_start"].strftime("%Y-%m-%dT%H:%M:%S")
-    lme = d["last_month_end"].strftime("%Y-%m-%dT%H:%M:%S")
-    ys  = d["year_start"].strftime("%Y-%m-%dT%H:%M:%S")
-    l12 = d["last_12m_start"].strftime("%Y-%m-%dT%H:%M:%S")
-    ts  = d["today_start"].strftime("%Y-%m-%dT%H:%M:%S")
+    return f"""You are a senior MongoDB analyst for Invock ERP.
+Return ONLY a single valid JSON object. No markdown, no backticks, no explanation outside JSON.
 
-    company_note = ""
-    if company_context:
-        company_note = f"\n⚠️ COMPANY RESOLVED: {company_context}\nUse the iCompanyId above to filter Voucher/Item/etc.\n"
-
-    return f"""You are a senior MongoDB analyst for Invock ERP (jewellery business, India, ₹ INR).
-Return ONLY one valid JSON object. No markdown, no backticks, no explanation.
-
+JSON format:
 {{
-  "query_type": "aggregate" | "find" | "count" | "none",
+  "query_type": "aggregate"|"find"|"none",
   "collection": "<exact collection name>",
   "pipeline": [...] | null,
   "find_query": {{...}} | null,
-  "projection": {{"_id":0}} | null,
+  "projection": {{"_id":0,...}} | null,
+  "sort": {{...}} | null,
   "limit": 50,
   "answer_template": "<one sentence>",
   "chart_suggestion": {{
-    "type": "bar"|"line"|"pie"|"metric"|"table"|"none",
-    "x_field": "<exact output field>",
-    "y_field": "<exact output field>",
-    "title": "<title>"
+    "type": "bar"|"line"|"metric"|"table"|"none",
+    "x_field": "<exact output field name>",
+    "y_field": "<exact output field name>",
+    "title": "<chart title>"
   }},
   "clarification_needed": false
 }}
 
-{company_note}
-DATE CONTEXT:
-  LM_NUM={d['lm_num']} LM_YEAR={d['lm_year']} TM_NUM={d['tm_num']} TY={d['ty']}
-  last_month: "{lms}" to "{lme}"
-  year_start: "{ys}"  last_12m: "{l12}"  today: "{ts}"
+DATE CONTEXT (today = {d['now'].strftime('%Y-%m-%d')}):
+  TY={d['ty']}  LM_NUM={d['lm_num']}  LM_YEAR={d['lm_year']}
+  last_month: {d['last_month_start'].strftime('%Y-%m-%dT%H:%M:%S')} to {d['last_month_end'].strftime('%Y-%m-%dT%H:%M:%S')}
+  year_start: {d['year_start'].strftime('%Y-%m-%dT%H:%M:%S')}
 
-DATE RULE: issueDate is MongoDB Date object. ALWAYS prefer ItemQuantityTracker
-  (integer year/month fields — no date conversion needed).
+CRITICAL RULES:
+1. Use ItemQuantityTracker for all date/product queries (has integer year/month — no date conversion needed)
+2. For Voucher date queries, issueDate is a DATE OBJECT — always pass ISO strings, agent converts to datetime
+3. Collection names are CASE-SENSITIVE
+4. Every aggregation MUST end with $project that excludes _id and names all output fields
+5. Never include itemList/transactions/tax/party/voucherList in Voucher projections
+6. chart x_field and y_field must be EXACT output field names from your $project stage
+7. For count queries: use $count stage, project the count field
+8. clarification_needed is ALWAYS false
+9. Do NOT filter iCompanyId — the agent handles company filtering separately"""
 
-STRICT RULES:
-1. Collections CASE-SENSITIVE: Voucher,Item,Business,ItemQuantityTracker,ItemSummary,
-   Contact,Account,IBranch,IUser,ICompany,ItemGroup,company_data,voucher_count
-2. Aggregations MUST end with: {{"$project":{{"_id":0,"field1":1,"field2":1,...}}}}
-3. Voucher find: SAFE PROJECTION ONLY (no itemList/transactions/tax/party/voucherList)
-4. For company-specific queries use iCompanyId filter (provided above if resolved)
-5. For counts: use aggregate with $count stage → project as {{count_field: 1}}
-6. chart x_field/y_field = EXACT output field names from $project
-7. clarification_needed = false always
-8. Filter iCompanyId: {{$ne:null}} for analytics to skip test data
-9. NEVER hallucinate data — only describe what the query would return"""
-
-def parse_json(text: str) -> Dict:
+def parse_json(text:str)->Dict:
     text = re.sub(r"```(?:json)?\n?","",text.strip()).strip("`").strip()
     try: return json.loads(text)
     except:
-        m = re.search(r"\{.*\}", text, re.DOTALL)
+        m = re.search(r"\{.*\}",text,re.DOTALL)
         if m:
             try: return json.loads(m.group())
             except: pass
-    return {"query_type":"none","collection":None,"pipeline":None,"find_query":None,
-            "answer_template":"Could not parse response.",
+    return {"query_type":"none","answer_template":"Parse error.",
             "chart_suggestion":{"type":"none"},"clarification_needed":False}
 
-# ── Valid collections ─────────────────────────────────────────────────────────
+# ──────────────────────────── DIRECT QUERY ENGINE ─────────────────────────────
+# Handles company-specific questions without relying on LLM for filter values
 
-VALID_COLS = {
-    "Voucher","Item","Business","ItemQuantityTracker","ItemSummary","Contact",
-    "Account","IBranch","IUser","ICompany","ItemGroup","company_data","voucher_count",
-    "AccountGroup","IBank","ItemColor","ItemCollection","ItemTag","ItemTagItem",
-    "IRoleConfig","ItemAttribute","ItemAttributeValue","ItemService","demoContact",
-    "PartyTag","AccessToken","BusinessContact","VersionTracking"
-}
+class DirectQueryEngine:
+    """Execute precise queries directly — no LLM needed for well-known patterns."""
 
-# ── Agent class ───────────────────────────────────────────────────────────────
+    def __init__(self, client, date_type):
+        self.db        = get_db(client)
+        self.date_type = date_type
+
+    def _cid_filter(self, company):
+        """Return the correct iCompanyId filter using the real_id."""
+        return {"iCompanyId": company["real_id"]}
+
+    def voucher_count(self, company, vtype=None):
+        f = self._cid_filter(company)
+        if vtype: f["type"] = vtype
+        count = self.db["Voucher"].count_documents(f)
+        agg = run_agg(self.db,"Voucher",[
+            {"$match": f},
+            {"$group": {"_id": None,
+                        "total_vouchers": {"$sum": 1},
+                        "total_amount":   {"$sum": "$billFinalAmount"}}},
+            {"$project": {"_id":0,"total_vouchers":1,"total_amount":1}}
+        ])
+        data = agg if agg else [{"total_vouchers": count, "total_amount": 0}]
+        label = vtype or "all"
+        return data, {
+            "type":"metric","x_field":None,"y_field":"total_vouchers",
+            "title":f"{company['name']} — {label.title()} Vouchers"
+        }
+
+    def voucher_by_status(self, company, status=None):
+        f = self._cid_filter(company)
+        if status: f["status"] = status
+        data = run_agg(self.db,"Voucher",[
+            {"$match": f},
+            {"$group": {"_id":"$status","count":{"$sum":1},"amount":{"$sum":"$billFinalAmount"}}},
+            {"$project":{"_id":0,"status":"$_id","count":1,"amount":1}},
+            {"$sort":{"count":-1}}
+        ])
+        return data, {"type":"bar","x_field":"status","y_field":"amount",
+                      "title":f"{company['name']} — Vouchers by Status"}
+
+    def top_customers(self, company, limit=10):
+        f = {**self._cid_filter(company), "type":"sales"}
+        data = run_agg(self.db,"Voucher",[
+            {"$match": f},
+            {"$group": {"_id":"$party.name","revenue":{"$sum":"$billFinalAmount"},
+                        "count":{"$sum":1}}},
+            {"$sort":{"revenue":-1}},{"$limit":limit},
+            {"$project":{"_id":0,"customer":"$_id","revenue":1,"count":1}}
+        ])
+        return data, {"type":"bar","x_field":"customer","y_field":"revenue",
+                      "title":f"{company['name']} — Top Customers"}
+
+    def top_products(self, company, by="amount", limit=10):
+        f = {**self._cid_filter(company), "voucherType":"sales"}
+        yf = "amount" if by=="amount" else "qty"
+        data = run_agg(self.db,"ItemQuantityTracker",[
+            {"$match": f},
+            {"$group": {"_id":"$itemId", yf:{"$sum":f"${yf}"}}},
+            {"$sort":{yf:-1}},{"$limit":limit},
+            {"$project":{"_id":0,"item":"$_id",yf:1}}
+        ])
+        return data, {"type":"bar","x_field":"item","y_field":yf,
+                      "title":f"{company['name']} — Top Products"}
+
+    def monthly_trend(self, company, years=None):
+        d = get_dates()
+        yrs = years or [d["ty"]-1, d["ty"]]
+        f = {**self._cid_filter(company), "voucherType":"sales",
+             "year":{"$in": yrs}}
+        data = run_agg(self.db,"ItemQuantityTracker",[
+            {"$match": f},
+            {"$group": {"_id":{"year":"$year","month":"$month"},
+                        "amount":{"$sum":"$amount"}}},
+            {"$sort":{"_id":1}},
+            {"$project":{"_id":0,"year":"$_id.year","month":"$_id.month","amount":1}}
+        ])
+        return data, {"type":"line","x_field":"month","y_field":"amount",
+                      "title":f"{company['name']} — Monthly Sales Trend"}
+
+    def total_revenue(self, company, year=None):
+        d = get_dates()
+        f = {**self._cid_filter(company), "voucherType":"sales"}
+        if year: f["year"] = year or d["ty"]
+        data = run_agg(self.db,"ItemQuantityTracker",[
+            {"$match": f},
+            {"$group": {"_id":None,"total_revenue":{"$sum":"$amount"}}},
+            {"$project":{"_id":0,"total_revenue":1}}
+        ])
+        return data, {"type":"metric","x_field":None,"y_field":"total_revenue",
+                      "title":f"{company['name']} — Total Revenue"}
+
+    def unpaid_invoices(self, company):
+        f = {**self._cid_filter(company), "status":"unpaid"}
+        data = run_find(self.db,"Voucher",f,
+                        {"_id":0,"voucherNo":1,"billFinalAmount":1,"dueAmount":1,
+                         "issueDate":1,"status":1},limit=50,sort=[("dueAmount",-1)])
+        return data, {"type":"table","x_field":"voucherNo","y_field":"dueAmount",
+                      "title":f"{company['name']} — Unpaid Invoices"}
+
+    def handle(self, question:str, company:Dict):
+        """Route company-specific question to the right direct query."""
+        q = question.lower()
+        d = get_dates()
+
+        # voucher count by type
+        if re.search(r"how many.*(sales|purchase).*(voucher|invoice|bill)", q) or \
+           re.search(r"(sales|purchase).*(voucher|invoice|bill).*(count|how many|total number)", q):
+            vtype = "sales" if "sales" in q else "purchase" if "purchase" in q else None
+            return self.voucher_count(company, vtype)
+
+        if re.search(r"how many.*voucher|voucher.*count|number of.*voucher|count.*voucher", q):
+            vtype = "sales" if "sales" in q else "purchase" if "purchase" in q else None
+            return self.voucher_count(company, vtype)
+
+        if re.search(r"top.*customer|best.*customer|customer.*revenue|customer.*sales", q):
+            return self.top_customers(company)
+
+        if re.search(r"top.*product|best.*product|product.*revenue|product.*qty|item.*sold", q):
+            by = "qty" if "qty" in q or "quantity" in q else "amount"
+            return self.top_products(company, by)
+
+        if re.search(r"monthly.*trend|trend.*month|sales.*month|month.*sales", q):
+            return self.monthly_trend(company)
+
+        if re.search(r"total.*revenue|revenue.*total|total.*sales|sales.*total", q):
+            yr = d["ty"] if "this year" in q or "ytd" in q else None
+            return self.total_revenue(company, yr)
+
+        if re.search(r"unpaid|outstanding|due|overdue", q):
+            return self.unpaid_invoices(company)
+
+        if re.search(r"status|paid|partial", q):
+            return self.voucher_by_status(company)
+
+        # Default: sales voucher count
+        vtype = "sales" if "sales" in q else "purchase" if "purchase" in q else None
+        return self.voucher_count(company, vtype)
+
+
+# ──────────────────────────── Agent ───────────────────────────────────────────
 
 class MongoAIAgent:
     def __init__(self):
-        self.client    = get_mongo_client()
-        self.llm       = None
-        self.history   = []
+        self.client   = get_mongo_client()
+        self.llm      = None
+        self.history  = []
         self.collection_stats = {}
-        self.date_type = "string"
+        self.date_type = "date_object"
         if self.client:
             try:
                 self.collection_stats = get_collection_stats(self.client)
                 self.date_type = detect_date_type(self.client)
                 print(f"[Agent] issueDate type: {self.date_type}")
             except Exception as e:
-                print(f"[Agent] init: {e}")
+                print(f"[Agent] init error: {e}")
 
     def is_connected(self): return self.client is not None
 
@@ -423,369 +441,210 @@ class MongoAIAgent:
         try: self.llm = get_llm(); return True
         except: return False
 
-    # ── Keyword shortcut (no LLM needed for simple questions) ─────────────────
-    def _shortcut(self, q: str):
-        def p(qt,col,pipeline=None,find_query=None,proj=None,limit=50,
-              template="",ct="table",x=None,y=None,title=""):
-            return {"query_type":qt,"collection":col,"pipeline":pipeline,
-                    "find_query":find_query,"projection":proj,"limit":limit,
-                    "answer_template":template,
+    # ── Keyword shortcut for simple schema-level queries ──────────────────────
+    def _shortcut(self, q:str) -> Optional[Dict]:
+        has = lambda *ws: any(w in q for w in ws)
+        hasnot = lambda *ws: not any(w in q for w in ws)
+
+        def plan(qt,col,pipe=None,fq=None,proj=None,limit=100,
+                 tmpl="",ct="table",x=None,y=None,title=""):
+            return {"query_type":qt,"collection":col,"pipeline":pipe,
+                    "find_query":fq,"projection":proj,"limit":limit,
+                    "answer_template":tmpl,
                     "chart_suggestion":{"type":ct,"x_field":x,"y_field":y,"title":title},
                     "clarification_needed":False}
 
-        has = lambda *ws: any(w in q for w in ws)
-        hasnt = lambda *ws: not any(w in q for w in ws)
+        # Only fire shortcuts for clearly generic (no specific company) questions
+        if has("branch","branches") and hasnot("sales","revenue","voucher","customer","company","with","in","for"):
+            return plan("find","IBranch",fq={},proj={"_id":0,"name":1,"city":1,"state":1,"code":1},
+                        limit=300,tmpl="All branches.",ct="table",title="All Branches")
 
-        if has("branch","branches") and hasnt("sales","revenue","voucher","customer"):
-            return p("find","IBranch",find_query={},
-                     proj={"_id":0,"name":1,"city":1,"state":1,"code":1,"gstBusinessType":1},
-                     limit=300,template="All branches.",ct="table",title="All Branches")
+        if has("user","users") and hasnot("sales","revenue","voucher","company","with","in","for"):
+            return plan("find","IUser",fq={},proj={"_id":0,"name":1,"phone":1,"lastSignIn":1},
+                        limit=500,tmpl="All users.",ct="table",title="All Users")
 
-        if has("user","users") and hasnt("sales","revenue","voucher"):
-            return p("find","IUser",find_query={},
-                     proj={"_id":0,"name":1,"phone":1,"lastSignIn":1},
-                     limit=500,template="All users.",ct="table",title="All Users")
+        if re.match(r"^(list |show |get )?(all )?compan", q) and hasnot("with","in","for","sales","voucher"):
+            return plan("find","ICompany",fq={},proj={"_id":0,"name":1,"industry":1,"financialYear":1},
+                        limit=200,tmpl="All companies.",ct="table",title="All Companies")
 
-        # Only shortcut to list ALL companies if no specific company name mentioned
-        if has("compan","companies") and hasnt("most voucher","sales","revenue","with","in","for","of"):
-            # make sure it's a generic "list companies" not "company with X"
-            generic = any(p in q for p in ["list compan","all compan","how many compan",
-                                            "show compan","compan list","compan count"])
-            if generic:
-                return p("find","ICompany",find_query={},
-                         proj={"_id":0,"name":1,"industry":1,"financialYear":1},
-                         limit=200,template="All companies.",ct="table",title="All Companies")
-
-        if "how many customer" in q:
-            return p("aggregate","Business",
-                     pipeline=[{"$match":{"relationType":"customer"}},{"$count":"customer_count"}],
-                     template="Total customers.",ct="metric",y="customer_count",title="Total Customers")
-
-        if "how many supplier" in q:
-            return p("aggregate","Business",
-                     pipeline=[{"$match":{"relationType":"supplier"}},{"$count":"supplier_count"}],
-                     template="Total suppliers.",ct="metric",y="supplier_count",title="Total Suppliers")
+        if re.match(r"^how many (customer|supplier)", q):
+            rel = "customer" if "customer" in q else "supplier"
+            field = f"total_{rel}s"
+            return plan("aggregate","Business",
+                        pipe=[{"$match":{"relationType":rel}},{"$count":field}],
+                        tmpl=f"Total {rel}s.",ct="metric",y=field,title=f"Total {rel.title()}s")
         return None
 
-    # ── Main query entry point ─────────────────────────────────────────────────
-    def query(self, question: str) -> Dict:
+    # ── Main query ─────────────────────────────────────────────────────────────
+    def query(self, question:str) -> Dict:
         if not self.llm:
             if not self.init_llm():
                 return {"error":"GROQ_API_KEY not configured."}
 
         q_lower = question.lower().strip()
 
-        # 1. Try keyword shortcut first
+        # 1. Simple shortcut (no company context needed)
         shortcut = self._shortcut(q_lower)
         if shortcut:
-            results, err = self._run(shortcut)
-            answer = self._honest_answer(question, shortcut, results, err)
-            chart  = self._chart(results, shortcut.get("chart_suggestion",{}))
-            self.history.append({"q":question,"a":shortcut.get("answer_template","")[:100]})
+            results, err = self._execute(shortcut)
+            answer = self._answer(question, shortcut, results, err)
+            chart  = self._make_chart(results, shortcut["chart_suggestion"])
+            self.history.append({"q":question,"a":shortcut["answer_template"][:80]})
             return {"type":"answer","answer":answer,"results":results,
                     "chart":chart,"plan":shortcut,"db_error":err}
 
-        # 2. Company name resolution — detect if question mentions a specific company
-        company_context = ""
-        resolved_company = None
+        # 2. Detect if question is company-specific
+        cname = extract_company_name(question)
+        company = None
+        if cname and self.client:
+            company = find_company(self.client, cname)
+            if company is None:
+                return {
+                    "type":"answer",
+                    "answer": f"❌ No company matching **\"{cname}\"** found in the database.\n\nTry: *\"list all companies\"* to see available names.",
+                    "results":[],"chart":None,"plan":{},"db_error":None
+                }
 
-        # Trigger company lookup if question contains company-related keywords
-        COMPANY_TRIGGERS = [
-            "company","compan","namo","shivaya","invock","aman","shraddha",
-            "hussain","qamber","creative","waja","vouchers in","vouchers of",
-            "vouchers for","sales in","purchases in","items in","records in",
-            "estimate","in company","with company","for company","of company",
-        ]
-        should_resolve = any(kw in q_lower for kw in COMPANY_TRIGGERS)
+        # 3. Company-specific: use DirectQueryEngine (no LLM for filters)
+        if company and self.client:
+            print(f"[Agent] Company resolved: '{company['name']}' real_id={company['real_id']!r} total_vouchers={company['total_vouchers']}")
+            dqe = DirectQueryEngine(self.client, self.date_type)
+            try:
+                results_raw, chart_sug = dqe.handle(question, company)
+                plan = {"query_type":"direct","collection":"Voucher",
+                        "answer_template": f"Direct query for {company['name']}.",
+                        "chart_suggestion": chart_sug, "clarification_needed": False}
+                results = [deep_sanitize(r) for r in results_raw]
+                answer  = self._answer(question, plan, results, None, company)
+                chart   = self._make_chart(results, chart_sug)
+                self.history.append({"q":question,"a":plan["answer_template"][:80]})
+                return {"type":"answer","answer":answer,"results":results,
+                        "chart":chart,"plan":plan,"db_error":None}
+            except Exception as e:
+                print(f"[Agent] DirectQueryEngine error: {e}")
+                # Fall through to LLM
 
-        if self.client and should_resolve:
-            cname = extract_company_name(question)
-            if cname:
-                match = find_best_company(self.client, cname)
-                if match:
-                    resolved_company = match
-                    company_context = (
-                        f"User mentioned company: '{cname}'\n"
-                        f"Best match found: '{match['name']}' (iCompanyId = \"{match['_id']}\")\n"
-                        f"Use this iCompanyId to filter queries."
-                    )
-                    print(f"[Agent] Resolved '{cname}' → '{match['name']}' ({match['_id']})")
-                else:
-                    # Company name given but NOT found → honest answer, no hallucination
-                    return {
-                        "type":"answer",
-                        "answer": (f"❌ Could not find a company matching **\"{cname}\"** in the database.\n\n"
-                                   f"Please check the company name and try again. "
-                                   f"You can ask *\"list all companies\"* to see available names."),
-                        "results": [], "chart": None, "plan": {}, "db_error": None
-                    }
-
-        # 3. Build prompt and call LLM
+        # 4. General question — use LLM
         dates = get_dates()
-        system_prompt = build_prompt(dates, self.date_type, company_context)
+        system_prompt = build_prompt(dates, self.date_type)
         hist = ""
         if self.history:
-            hist = "\nConversation:\n" + "\n".join(f"Q:{h['q']}\nA:{h['a']}" for h in self.history[-3:])
+            hist = "\nPrevious:\n" + "\n".join(f"Q:{h['q']}\nA:{h['a']}" for h in self.history[-3:])
         user_msg = f"{SCHEMA}\n{hist}\n\nQuestion: {question}"
-
         try:
-            resp = self.llm.invoke([SystemMessage(content=system_prompt), HumanMessage(content=user_msg)])
+            resp = self.llm.invoke([SystemMessage(content=system_prompt),
+                                    HumanMessage(content=user_msg)])
             plan = parse_json(resp.content)
         except Exception as e:
             return {"error":f"LLM error: {e}"}
 
-        # 4. Inject resolved company id into pipeline/query if available
-        if resolved_company:
-            real_id = self._get_real_company_id(resolved_company)
-            resolved_company["real_id"] = real_id  # store for answer generation
-            plan = self._inject_company_id(plan, real_id)
+        results, err = self._execute(plan)
 
-        results, err = self._run(plan)
-
-        # 5. Retry if empty
+        # 5. Auto-retry if empty
         if not results and not err and plan.get("query_type") != "none":
-            results, err, plan = self._retry(question, plan, system_prompt, user_msg, dates, resolved_company)
+            results, err, plan = self._retry(question, plan, system_prompt, user_msg, dates)
 
-        # 6. Last resort: if company resolved but still no results, do a direct count
-        if not results and not err and resolved_company:
-            results, err, plan = self._direct_company_count(question, resolved_company)
-
-        answer = self._honest_answer(question, plan, results, err, resolved_company)
-        chart  = self._chart(results, plan.get("chart_suggestion",{}))
-        self.history.append({"q":question,"a":plan.get("answer_template","")[:100]})
-
+        answer = self._answer(question, plan, results, err)
+        chart  = self._make_chart(results, plan.get("chart_suggestion",{}))
+        self.history.append({"q":question,"a":plan.get("answer_template","")[:80]})
         return {"type":"answer","answer":answer,"results":results,
                 "chart":chart,"plan":plan,"db_error":err}
 
-    def _get_real_company_id(self, resolved: Dict) -> Any:
-        """
-        Return the iCompanyId value in the exact format Voucher collection uses.
-        Debug confirmed: Voucher.iCompanyId is stored as ObjectId (not string).
-        So we always prefer the raw ObjectId.
-        """
-        if not self.client or not resolved: return resolved.get("_id")
-        db    = get_db(self.client)
-        obj_id = resolved.get("_id_obj")   # raw ObjectId  ← this is what works
-        str_id = resolved.get("_id")       # string version
-
-        # Try ObjectId first (confirmed format from debug_company.py)
-        if obj_id:
-            try:
-                n = db["Voucher"].count_documents({"iCompanyId": obj_id}, maxTimeMS=3000)
-                if n > 0:
-                    print(f"[Agent] iCompanyId=ObjectId, {n} vouchers for '{resolved['name']}'")
-                    return obj_id
-            except Exception as e:
-                print(f"[Agent] ObjectId probe error: {e}")
-
-        # Fallback: string
-        if str_id:
-            try:
-                n = db["Voucher"].count_documents({"iCompanyId": str_id}, maxTimeMS=3000)
-                if n > 0:
-                    print(f"[Agent] iCompanyId=string, {n} vouchers for '{resolved['name']}'")
-                    return str_id
-            except: pass
-
-        # Last resort: scan distinct and find exact match
-        try:
-            ids = db["Voucher"].distinct("iCompanyId")
-            for vid in ids:
-                if str(vid) == str_id:
-                    print(f"[Agent] iCompanyId found via scan: {vid!r} for '{resolved['name']}'")
-                    return vid
-        except: pass
-
-        # Return ObjectId anyway (best guess)
-        print(f"[Agent] WARNING: falling back to ObjectId for '{resolved['name']}'")
-        return obj_id or str_id
-
-    def _inject_company_id(self, plan: Dict, company_id: Any) -> Dict:
-        """Inject iCompanyId filter into pipeline $match or find_query."""
-        try:
-            if plan.get("query_type") == "aggregate" and plan.get("pipeline"):
-                pipe = plan["pipeline"]
-                for stage in pipe:
-                    if "$match" in stage:
-                        stage["$match"]["iCompanyId"] = company_id
-                        return plan
-                plan["pipeline"] = [{"$match": {"iCompanyId": company_id}}] + pipe
-            elif plan.get("query_type") == "find":
-                fq = plan.get("find_query") or {}
-                fq["iCompanyId"] = company_id
-                plan["find_query"] = fq
-        except: pass
-        return plan
-
-    def _direct_company_count(self, question: str, resolved_company: Dict):
-        """
-        Bypass LLM entirely — directly count/fetch Vouchers for this company.
-        Tries every possible iCompanyId format.
-        """
-        if not self.client: return [], None, {}
-        db = get_db(self.client)
-        q_lower = question.lower()
-
-        # Determine voucher type from question
-        if "sales" in q_lower:
-            v_filter = {"type": "sales"}
-            v_label = "sales"
-        elif "purchase" in q_lower:
-            v_filter = {"type": "purchase"}
-            v_label = "purchase"
-        else:
-            v_filter = {}
-            v_label = "all"
-
-        # Try ObjectId first (confirmed by debug_company.py output), then string
-        obj_id = resolved_company.get("_id_obj")
-        str_id = resolved_company.get("real_id") or resolved_company.get("_id", "")
-        comp_name = resolved_company["name"]
-        id_candidates = [c for c in [obj_id, str_id] if c is not None]
-
-        for cid in id_candidates:
-            try:
-                q = dict(v_filter)
-                q["iCompanyId"] = cid
-                count = db["Voucher"].count_documents(q, maxTimeMS=5000)
-                if count > 0:
-                    pipeline = [
-                        {"$match": q},
-                        {"$group": {"_id": None,
-                                    "total_vouchers": {"$sum": 1},
-                                    "total_amount":   {"$sum": "$billFinalAmount"}}},
-                        {"$project": {"_id":0,"total_vouchers":1,"total_amount":1}}
-                    ]
-                    agg = list(db["Voucher"].aggregate(pipeline))
-                    result_plan = {
-                        "query_type": "aggregate", "collection": "Voucher",
-                        "pipeline": pipeline, "find_query": None,
-                        "answer_template": f"Count of {v_label} vouchers for {comp_name}.",
-                        "chart_suggestion": {"type":"metric","x_field":None,
-                                             "y_field":"total_vouchers",
-                                             "title":f"{comp_name} — {v_label.title()} Vouchers"},
-                        "clarification_needed": False
-                    }
-                    print(f"[Agent] Direct count: {count} {v_label} vouchers for '{comp_name}' (cid={cid!r})")
-                    return ([deep_sanitize(r) for r in agg]
-                            if agg else [{"total_vouchers": count, "total_amount": 0}]), None, result_plan
-            except Exception as e:
-                print(f"[Agent] Direct count error with cid={cid!r}: {e}")
-
-        # Nothing found — company exists but genuinely has no vouchers of this type
-        result_plan = {
-            "query_type": "none", "collection": "Voucher",
-            "answer_template": f"No {v_label} vouchers for '{comp_name}'.",
-            "chart_suggestion": {"type":"none"}, "clarification_needed": False
-        }
-        return [], None, result_plan
-
     def _resolve_col(self, col):
         if col in VALID_COLS: return col
-        lm = {c.lower():c for c in VALID_COLS}
-        return lm.get((col or "").lower(), col)
+        return {c.lower():c for c in VALID_COLS}.get((col or "").lower(), col)
 
-    def _run(self, plan):
+    def _execute(self, plan) -> tuple:
         qt = plan.get("query_type")
         if qt not in ("aggregate","find") or not self.client: return [], None
         col = self._resolve_col(plan.get("collection",""))
         plan["collection"] = col
-        if qt == "aggregate" and plan.get("pipeline"):
-            pipe = convert_dt_strings(plan["pipeline"]) if self.date_type=="date_object" else plan["pipeline"]
-            return execute_agg(self.client, col, pipe)
-        if qt == "find" and plan.get("find_query") is not None:
-            fq = convert_dt_strings([plan["find_query"]])[0] if self.date_type=="date_object" else plan["find_query"]
-            return execute_find(self.client, col, fq, plan.get("projection"), plan.get("limit",50))
+        db = get_db(self.client)
+        try:
+            if qt == "aggregate" and plan.get("pipeline"):
+                pipe = dt_str_to_obj(plan["pipeline"]) if self.date_type=="date_object" else plan["pipeline"]
+                return run_agg(db, col, pipe), None
+            if qt == "find" and plan.get("find_query") is not None:
+                fq   = dt_str_to_obj([plan["find_query"]])[0] if self.date_type=="date_object" else plan["find_query"]
+                proj = plan.get("projection")
+                srt  = list(plan["sort"].items()) if plan.get("sort") else None
+                lim  = plan.get("limit", 100)
+                return run_find(db, col, fq, proj, lim, srt), None
+        except Exception as e:
+            return [], str(e)
         return [], None
 
-    def _retry(self, question, orig, system_prompt, user_msg, dates, resolved_company=None):
+    def _retry(self, question, orig, sys_p, usr_msg, dates):
         d = dates
         hint = f"""
 ⚠️ RETRY — '{orig.get("collection")}' returned 0 results.
-Pipeline: {json.dumps(orig.get("pipeline"), default=str)[:250]}
+Failed pipeline: {json.dumps(orig.get("pipeline"), default=str)[:200]}
 
-Fixes to try:
-1. Use ItemQuantityTracker with integer year/month (no date conversion needed):
-   last month: {{"voucherType":"sales","year":{d['lm_year']},"month":{d['lm_num']}}}
+Fixes:
+1. Use ItemQuantityTracker with integer year/month (most reliable for date queries):
    this year:  {{"voucherType":"sales","year":{d['ty']}}}
-2. Remove $ne null iCompanyId filter if too strict
-3. For "sales vs purchases": group Voucher by "$type", no date filter
-4. For company count: just count Voucher with iCompanyId={resolved_company['_id'] if resolved_company else 'X'}
+   last month: {{"voucherType":"sales","year":{d['lm_year']},"month":{d['lm_num']}}}
+2. Remove any iCompanyId filter ($ne null etc.)
+3. For sales vs purchases: group Voucher by "$type" with NO date filter
 
 Question: {question}"""
         try:
-            resp = self.llm.invoke([SystemMessage(content=system_prompt), HumanMessage(content=user_msg+hint)])
+            resp = self.llm.invoke([SystemMessage(content=sys_p),
+                                    HumanMessage(content=usr_msg+hint)])
             plan2 = parse_json(resp.content)
-            if resolved_company:
-                real_id = resolved_company.get("real_id", resolved_company.get("_id"))
-                plan2 = self._inject_company_id(plan2, real_id)
-            r, e = self._run(plan2)
+            r, e = self._execute(plan2)
             return r, e, plan2
         except Exception as e:
             return [], str(e), orig
 
-    def _honest_answer(self, question, plan, results, db_error, resolved_company=None):
-        """Generate answer — honest about what was/wasn't found, no hallucination."""
+    def _answer(self, question, plan, results, db_error, company=None):
         if db_error:
             return f"⚠️ **Database error:** `{db_error}`"
-
         if plan.get("query_type") == "none":
-            return plan.get("answer_template","I couldn't find relevant data for that question.")
-
+            return plan.get("answer_template","No data found.")
         if not results:
-            if resolved_company:
-                return (
-                    f"**{resolved_company['name']}** was found in the database ✓, "
-                    f"but has **no matching records** for this query.\n\n"
-                    f"This company may be a test/demo account, or it may not have "
-                    f"any transactions of this type recorded yet."
-                )
-            return (
-                f"**No records found.**\n\n"
-                f"The query ran successfully but matched zero documents. "
-                f"Try adjusting your filters or check if data exists for this period."
-            )
-
-        # Build honest, grounded analysis
-        company_note = f" for **{resolved_company['name']}**" if resolved_company else ""
+            if company:
+                return (f"**{company['name']}** was found in the database ✓\n\n"
+                        f"But there are **no records** matching this specific query "
+                        f"(company has {company['total_vouchers']:,} total vouchers).\n\n"
+                        f"Try: *sales vouchers, purchases, customers, monthly trend, revenue*")
+            return "**No records found.** The query ran but matched zero documents."
+        co = f" for **{company['name']}**" if company else ""
         prompt = (
-            f"You are a data analyst for Invock ERP (jewellery business, India, ₹ INR).\n"
+            f"You are a precise data analyst for Invock ERP (India, ₹ INR).\n"
             f"Question: {question}\n"
-            f"Company context: {resolved_company['name'] if resolved_company else 'all companies'}\n\n"
-            f"Actual query results ({len(results)} records){company_note}:\n"
+            f"Company: {company['name'] if company else 'all companies'}\n\n"
+            f"Data ({len(results)} records){co}:\n"
             f"{json.dumps(results[:10], default=str, indent=2)}\n\n"
-            f"STRICT RULES for your response:\n"
-            f"1. Only describe what is ACTUALLY in the data above — no guessing or inventing figures\n"
-            f"2. If results are a count, state the count clearly\n"
-            f"3. Use ₹ with crore/lakh formatting\n"
-            f"4. Name actual top performers from the data\n"
-            f"5. Give one actionable business insight based on real numbers\n"
-            f"6. If data is insufficient to draw conclusions, say so honestly\n"
-            f"Keep it 3-4 sentences. Be precise."
+            f"RULES:\n"
+            f"1. ONLY use numbers that appear in the data above — NEVER invent figures\n"
+            f"2. State counts/totals precisely with ₹ crore/lakh formatting\n"
+            f"3. Name real top performers from the data\n"
+            f"4. Give 1 actionable insight based on real numbers only\n"
+            f"5. Keep to 3-4 sentences. No hallucination."
         )
-        try:
-            return self.llm.invoke([HumanMessage(content=prompt)]).content
-        except:
-            return f"Found {len(results)} record(s){company_note}."
+        try: return self.llm.invoke([HumanMessage(content=prompt)]).content
+        except: return f"Found {len(results)} record(s){co}."
 
-    def _chart(self, results, suggestion):
-        if not results or not suggestion or suggestion.get("type") in ("none",None): return None
+    def _make_chart(self, results, suggestion):
+        if not results or not suggestion or suggestion.get("type") in ("none",None):
+            return None
         try:
             clean = []
             for doc in results:
                 row = {}
                 for k,v in doc.items():
-                    if isinstance(v, bool):           row[k] = str(v)
-                    elif isinstance(v,(int,float,type(None))): row[k] = v
-                    elif isinstance(v, str):           row[k] = v
-                    elif isinstance(v, dict):          row[k] = str(v)
-                    elif isinstance(v, list):          row[k] = len(v)
-                    else:                              row[k] = str(v)
+                    if isinstance(v,bool): row[k]=str(v)
+                    elif isinstance(v,(int,float,type(None))): row[k]=v
+                    elif isinstance(v,str): row[k]=v
+                    elif isinstance(v,dict): row[k]=str(v)
+                    elif isinstance(v,list): row[k]=len(v)
+                    else: row[k]=str(v)
                 clean.append(row)
             df = pd.DataFrame(clean)
             if df.empty: return None
             for c in df.columns:
-                try: df[c] = pd.to_numeric(df[c])
+                try: df[c]=pd.to_numeric(df[c])
                 except: pass
             num = df.select_dtypes(include="number").columns.tolist()
             cat = df.select_dtypes(exclude="number").columns.tolist()
