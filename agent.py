@@ -166,17 +166,25 @@ def extract_company_name(question: str) -> Optional[str]:
         r"(?:show|get|fetch|display|find|list|give)\s+(?:me\s+)?(?:the\s+)?['\"]?([A-Za-z0-9][A-Za-z0-9 /\-&.']{2,50}?)['\"]?\s+(?:data|sales|vouchers?|revenue|customers?|trend)",
     ]
     stopwords = {"company","the","a","an","in","for","of","with","has","have",
-                 "me","my","all","this","that","these","those","its","their"}
+                 "me","my","all","this","that","these","those","its","their",
+                 "collection","icompany","ibranch","iuser","voucher","item",
+                 "id","search","find","get","show","list","fetch","what","which"}
+    # Reject if question contains a 24-hex ObjectId — handled by Step 0
+    if re.search(r'\b[0-9a-fA-F]{24}\b', question):
+        return None
     for pat in patterns:
         m = re.search(pat, q, re.IGNORECASE)
         if m:
             name = m.group(1).strip()
             # Remove trailing stop words
             name = re.sub(r'\b(' + '|'.join(stopwords) + r')\b\s*$', '', name, flags=re.I).strip()
-            # Reject if too short or is a generic word
+            # Reject hex IDs, too-short, or generic words
             generic = {"sales","purchase","voucher","revenue","data","record","item",
-                       "trend","customer","invoice","monthly","total","how","many","what"}
-            if len(name) >= 3 and name.lower() not in generic:
+                       "trend","customer","invoice","monthly","total","how","many","what",
+                       "collection","icompany","ibranch","search","find"}
+            if (len(name) >= 3
+                    and name.lower() not in generic
+                    and not re.match(r'^[0-9a-fA-F]{24}$', name)):
                 return name
     return None
 
@@ -786,6 +794,14 @@ class MongoAIAgent:
         q_low = question.lower().strip()
         db    = get_db(self.client) if self.client else None
 
+        # ── Step 0: ObjectId lookup + collection-specific direct queries ──────
+        # Handles: "name of company with id 5d2eb70ce6e46c0014bb7af9"
+        #          "search in ICompany collection, name of company with id X"
+        #          "which branch has id X", "find voucher with id X", etc.
+        direct = self._direct_id_or_collection_query(question, db)
+        if direct:
+            return direct
+
         # ── Step 1: Schema-level shortcut (no company) ────────────────────────
         sc = schema_shortcut(q_low)
         if sc:
@@ -817,7 +833,7 @@ class MongoAIAgent:
                 }
 
         # ── Step 3: Route to direct query (with or without company) ───────────
-        if db:
+        if db is not None:
             routed = route(question, company, db)
             if routed:
                 results_raw, chart_sug = routed
@@ -863,6 +879,146 @@ class MongoAIAgent:
         self.history.append({"q":question,"a":plan.get("answer_template","")[:80]})
         return {"type":"answer","answer":answer,"results":results,
                 "chart":chart,"plan":plan,"db_error":err}
+
+    def _direct_id_or_collection_query(self, question: str, db) -> Optional[Dict]:
+        """
+        Handle two special patterns that bypass all fuzzy matching:
+
+        1. ObjectId lookup in any collection:
+           "what is the name of icompany with id 5d2eb70ce6e46c0014bb7af9"
+           "find voucher with id 5d2eb70ce6e46c0014bb7af9"
+           "which branch has id 5d2eb70ce6e46c0014bb7af9"
+
+        2. Collection-explicit query:
+           "search in ICompany collection, name of company with id X"
+           "find in Voucher collection where type is sales"
+        """
+        if db is None: return None
+        q = question.strip()
+
+        # Fields to hide from user-facing output (internal/technical)
+        SKIP_FIELDS = {
+            "_id","__v","id","logoUrl","pancard","gstNo","primaryBranchId",
+            "eShopPathName","eShopViewCount","iShopSettings","printSettings",
+            "planDetails","companyVoucherSettings","ewayBillEInvoiceSetup",
+            "allowDuplicateItems","currencyDecimals","itemQtyDecimals",
+            "dateFormat","financialYearStart","bookStartDate","updatedAt",
+            "printName","taxDetails","bankDetails","signature","address",
+            "defaultTax","itemGroups","__typename","isDeleted","isActive",
+            "permissions","settings","config","metadata","createdAt",
+        }
+
+        # ── Pattern A: detect a 24-hex ObjectId anywhere in the question ─────
+        hex_id_match = re.search(r'\b([0-9a-fA-F]{24})\b', q)
+        if hex_id_match:
+            hex_id = hex_id_match.group(1)
+            obj_id = ObjectId(hex_id)
+
+            # Detect which collection to search
+            col_map = {
+                "icompany": "ICompany", "company": "ICompany",
+                "voucher": "Voucher", "invoice": "Voucher",
+                "item": "Item", "product": "Item",
+                "branch": "IBranch", "ibranch": "IBranch",
+                "user": "IUser", "iuser": "IUser",
+                "business": "Business", "contact": "Contact",
+                "account": "Account",
+            }
+            q_low = q.lower()
+            col = "ICompany"  # default — most common use case
+            for kw, c in col_map.items():
+                if kw in q_low:
+                    col = c; break
+
+            # Try _id lookup
+            try:
+                doc = db[col].find_one({"_id": obj_id})
+                if doc:
+                    doc = deep_sanitize(doc)
+                    # Show only human-relevant fields
+                    field_lines = "\n".join(
+                        f"• **{k}**: {v}" for k, v in doc.items()
+                        if k not in SKIP_FIELDS
+                        and v not in (None, "", [], {}, "null")
+                        and not isinstance(v, (list, dict))
+                    )
+                    name = doc.get("name") or doc.get("voucherNo") or doc.get("type") or hex_id
+                    answer = (f"✅ **{col}** record found for id `{hex_id}`:\n\n{field_lines}")
+                    plan = {"query_type":"find","collection":col,
+                            "answer_template":f"Found {col} record with _id {hex_id}.",
+                            "chart_suggestion":{"type":"none"},"clarification_needed":False}
+                    return {"type":"answer","answer":answer,"results":[doc],
+                            "chart":None,"plan":plan,"db_error":None}
+                else:
+                    # Try other collections if not found in guessed one
+                    for try_col in ["ICompany","Voucher","IBranch","Item","IUser","Business","Account"]:
+                        if try_col == col: continue
+                        doc = db[try_col].find_one({"_id": obj_id})
+                        if doc:
+                            doc = deep_sanitize(doc)
+                            name = doc.get("name") or doc.get("voucherNo") or str(obj_id)
+                            field_lines = "\n".join(
+                                f"• **{k}**: {v}" for k, v in doc.items()
+                                if k not in SKIP_FIELDS
+                                and v not in (None,"",[],"null")
+                                and not isinstance(v, (list,dict))
+                            )
+                            answer = f"Found **{try_col}** record for id `{hex_id}`:\n\n{field_lines}"
+                            plan = {"query_type":"find","collection":try_col,
+                                    "answer_template":f"Found {try_col} record with _id {hex_id}.",
+                                    "chart_suggestion":{"type":"none"},"clarification_needed":False}
+                            return {"type":"answer","answer":answer,"results":[doc],
+                                    "chart":None,"plan":plan,"db_error":None}
+                    # Not found anywhere
+                    answer = (f"❌ No document found with `_id = {hex_id}` in any collection.\n\n"
+                              f"Searched: ICompany, Voucher, IBranch, Item, IUser, Business, Account.")
+                    return {"type":"answer","answer":answer,"results":[],
+                            "chart":None,"plan":{},"db_error":None}
+            except Exception as e:
+                pass  # Fall through if ObjectId invalid
+
+        # ── Pattern B: explicit collection name mentioned ─────────────────────
+        col_explicit = None
+        for kw, cn in [("icompany","ICompany"),("ibranch","IBranch"),("iuser","IUser"),
+                        ("voucher","Voucher"),("item quantitytracker","ItemQuantityTracker"),
+                        ("itemquantitytracker","ItemQuantityTracker"),
+                        ("item","Item"),("business","Business"),
+                        ("account","Account"),("contact","Contact")]:
+            if kw in q.lower():
+                col_explicit = cn; break
+
+        if col_explicit and re.search(r"(find|search|get|show|list|fetch|what|which|name|all)", q.lower()):
+            # Build a simple find query based on what's asked
+            proj = None
+            fq   = {}
+
+            # "name of company with id X" — already handled above via hex pattern
+            # "list all items in Item collection"
+            if re.search(r"all|list|show all", q.lower()):
+                if col_explicit == "ICompany":
+                    proj = {"_id":0,"name":1,"industry":1,"financialYear":1}
+                elif col_explicit == "IBranch":
+                    proj = {"_id":0,"name":1,"city":1,"state":1,"code":1}
+                elif col_explicit == "IUser":
+                    proj = {"_id":0,"name":1,"phone":1,"lastSignIn":1}
+                elif col_explicit == "Item":
+                    proj = {"_id":0,"name":1,"availableQty":1,"unit":1}
+                    fq   = {"isHidden":False}
+                try:
+                    rows = find(db, col_explicit, fq, proj, limit=100)
+                    plan = {"query_type":"find","collection":col_explicit,
+                            "answer_template":f"Records from {col_explicit}.",
+                            "chart_suggestion":{"type":"table","x_field":"name",
+                                                "y_field":None,"title":f"{col_explicit} Records"},
+                            "clarification_needed":False}
+                    answer = self._answer(question, plan, rows, None)
+                    chart  = self._chart(rows, plan["chart_suggestion"])
+                    return {"type":"answer","answer":answer,"results":rows,
+                            "chart":chart,"plan":plan,"db_error":None}
+                except Exception as e:
+                    pass
+
+        return None  # not handled — continue to normal pipeline
 
     def _answer(self, question, plan, results, err, company=None):
         if err:
