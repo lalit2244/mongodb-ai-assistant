@@ -146,11 +146,14 @@ def resolve_company(client, name: str) -> Optional[Dict]:
 
 def extract_company_name(question: str) -> Optional[str]:
     """
-    Extract company name from any natural language pattern.
-    Handles: 'company with X', 'in company X', 'for X company',
-             'company named X', 'company id X', 'X company', plain 'X' after keywords.
+    Extract company name from natural language.
+    Conservative — only extracts when clearly after a preposition or possessive.
     """
     q = question.strip()
+    # Skip if question contains a 24-hex ObjectId — handled by Step 0
+    if re.search(r'\b[0-9a-fA-F]{24}\b', question):
+        return None
+
     patterns = [
         # "company with/named/called/of/id X"
         r"company\s+(?:with|named?|called?|of|id|having|like)?\s*['\"]?([A-Za-z0-9][A-Za-z0-9 /\-&.']{2,50}?)['\"]?\s*(?:\?|$|\.|,)",
@@ -158,33 +161,36 @@ def extract_company_name(question: str) -> Optional[str]:
         r"(?:in|for|of|from)\s+(?:the\s+)?company\s+['\"]?([A-Za-z0-9][A-Za-z0-9 /\-&.']{2,50}?)['\"]?\s*(?:\?|$|\.|,)",
         # "in/with/for X company"
         r"(?:in|with|for|from)\s+['\"]?([A-Za-z0-9][A-Za-z0-9 /\-&.']{2,50}?)['\"]?\s+company\b",
-        # "vouchers/sales/records in/of/for X"
-        r"(?:vouchers?|sales?|purchases?|records?|items?|data|revenue|customers?|trend|invoices?)\s+(?:in|of|for|from)\s+['\"]?([A-Za-z0-9][A-Za-z0-9 /\-&.']{2,50}?)['\"]?\s*(?:\?|$|\.|,)",
+        # "vouchers/sales in/of/for X"  — only with clear preposition, requires end anchor
+        r"(?:vouchers?|sales?|purchases?|records?|revenue|invoices?)\s+(?:in|of|for|from)\s+['\"]?([A-Za-z0-9][A-Za-z0-9 /\-&.']{2,40}?)['\"]?\s*(?:\?|$|\.|,)",
         # "X's vouchers/data/sales"
         r"([A-Za-z0-9][A-Za-z0-9 /\-&.']{2,40}?)(?:'s)\s+(?:vouchers?|sales?|data|revenue|customers?)",
-        # "show/get/fetch X data/sales/vouchers"
-        r"(?:show|get|fetch|display|find|list|give)\s+(?:me\s+)?(?:the\s+)?['\"]?([A-Za-z0-9][A-Za-z0-9 /\-&.']{2,50}?)['\"]?\s+(?:data|sales|vouchers?|revenue|customers?|trend)",
     ]
+
     stopwords = {"company","the","a","an","in","for","of","with","has","have",
                  "me","my","all","this","that","these","those","its","their",
                  "collection","icompany","ibranch","iuser","voucher","item",
                  "id","search","find","get","show","list","fetch","what","which"}
-    # Reject if question contains a 24-hex ObjectId — handled by Step 0
-    if re.search(r'\b[0-9a-fA-F]{24}\b', question):
-        return None
+
+    # Words that should NEVER be returned as a company name
+    generic = {"sales","purchase","voucher","revenue","data","record","item","companies",
+               "trend","customer","invoice","monthly","total","how","many","what","most",
+               "collection","icompany","ibranch","search","find","created","highest",
+               "top","list","show","all","ranked","best","number","count","maximum"}
+
     for pat in patterns:
         m = re.search(pat, q, re.IGNORECASE)
         if m:
             name = m.group(1).strip()
             # Remove trailing stop words
-            name = re.sub(r'\b(' + '|'.join(stopwords) + r')\b\s*$', '', name, flags=re.I).strip()
-            # Reject hex IDs, too-short, or generic words
-            generic = {"sales","purchase","voucher","revenue","data","record","item",
-                       "trend","customer","invoice","monthly","total","how","many","what",
-                       "collection","icompany","ibranch","search","find"}
+            name = re.sub(r'\b(' + '|'.join(re.escape(w) for w in stopwords) + r')\b\s*$',
+                          '', name, flags=re.I).strip()
+            # Reject hex IDs, too-short, generic words, or multi-word generic phrases
+            words = name.lower().split()
             if (len(name) >= 3
                     and name.lower() not in generic
-                    and not re.match(r'^[0-9a-fA-F]{24}$', name)):
+                    and not re.match(r'^[0-9a-fA-F]{24}$', name)
+                    and not all(w in generic for w in words)):  # reject if ALL words are generic
                 return name
     return None
 
@@ -416,6 +422,24 @@ def route(question: str, company: Optional[Dict], db) -> Optional[Tuple]:
     has  = lambda *ws: any(w in q for w in ws)
     miss = lambda *ws: not any(w in q for w in ws)
 
+    # ── Companies ranked by voucher count (with real names) ───────────────────
+    if re.search(r"(companies|company).*(most|top|highest|ranked?|maximum|max|list).*(voucher|sales|invoice)|"
+                 r"(most|top|highest).*(voucher|sales).*(compan)|"
+                 r"which compan.*(most|highest|top).*(voucher|sales)|"
+                 r"rank.*compan.*voucher|list compan.*voucher|compan.*most.*created|"
+                 r"top\s+\d*\s*compan.*(sales|voucher)|compan.*by.*(sales|voucher)|"
+                 r"list.*compan.*by.*(most|sales|voucher)|compan.*sales.*rank|"
+                 r"list.*compan.*(most|sales|voucher)|compan.*(created|having).*(sales|voucher)|"
+                 r"(sales|voucher).*(compan).*(list|rank|top|most)|"
+                 r"show.*compan.*(sales|voucher)|compan.*with.*most.*(sales|voucher)", q):
+        vtype = "purchase" if "purchase" in q else "sales"
+        lim   = 20
+        # extract number if mentioned: "top 5 companies"
+        nm = re.search(r"top\s+(\d+)", q)
+        if nm: lim = min(int(nm.group(1)), 50)
+        results, chart_sug = companies_by_voucher_count(db, vtype, lim)
+        return results, chart_sug
+
     # ── Voucher counts ────────────────────────────────────────────────────────
     if re.search(r"how many.*(sales|purchase|receipt|payment).*(voucher|invoice|bill|record)|"
                  r"(voucher|invoice|bill).*(count|how many|total number|number of)", q):
@@ -537,6 +561,39 @@ def route(question: str, company: Optional[Dict], db) -> Optional[Tuple]:
 
 # ═══════════════════════════ Schema-level shortcuts ════════════════════════════
 
+def companies_by_voucher_count(db, vtype="sales", limit=20) -> Tuple[List, Dict]:
+    """
+    Return companies ranked by voucher count with REAL NAMES (not ObjectIds).
+    Does a fast Python-side join: group Voucher by iCompanyId → lookup ICompany name.
+    """
+    pipe = [
+        {"$match": {"type": vtype}},
+        {"$group": {
+            "_id": "$iCompanyId",
+            "voucher_count": {"$sum": 1},
+            "total_amount":  {"$sum": "$billFinalAmount"}
+        }},
+        {"$sort": {"voucher_count": -1}},
+        {"$limit": limit}
+    ]
+    rows = list(db["Voucher"].aggregate(pipe, allowDiskUse=True))
+    all_cos = list(db["ICompany"].find({}, {"_id": 1, "name": 1}))
+    id_to_name = {str(c["_id"]): c.get("name", "Unknown") for c in all_cos}
+    result = []
+    for r in rows:
+        cid = str(r["_id"]) if r["_id"] else None
+        result.append({
+            "company": id_to_name.get(cid, f"Unknown ({cid[:8] if cid else '?'}...)"),
+            "voucher_count": int(r.get("voucher_count", 0)),
+            "total_amount":  round(float(r.get("total_amount", 0) or 0), 2)
+        })
+    chart = {
+        "type": "bar", "x_field": "company", "y_field": "voucher_count",
+        "title": f"Companies by {vtype.title()} Voucher Count"
+    }
+    return result, chart
+
+
 def schema_shortcut(q: str) -> Optional[Dict]:
     """Answer schema-level questions (no company context needed)."""
     d = get_dates()
@@ -565,7 +622,7 @@ def schema_shortcut(q: str) -> Optional[Dict]:
             limit=500,tmpl="All users.",ct="table",title="All Users")
 
     # Company list (generic)
-    if re.search(r"^(list |show |get |how many )?(all )?compan", q) and miss("with","in company","for","sales","voucher"):
+    if re.search(r"^(list |show |get |how many )?(all )?compan", q) and miss("with","in company","for","sales","voucher","most","top","rank"):
         return plan("find","ICompany",fq={},
             proj={"_id":0,"name":1,"industry":1,"financialYear":1},
             limit=200,tmpl="All companies.",ct="table",title="All Companies")
@@ -812,6 +869,33 @@ class MongoAIAgent:
             return {"type":"answer","answer":answer,"results":results,
                     "chart":chart,"plan":sc,"db_error":err}
 
+        # ── Step 1b: Company ranking shortcut (must run BEFORE extract_company_name) ──
+        # Catches: "list companies with most sales", "top 3 companies by vouchers", etc.
+        RANKING_PAT = (
+            r"(companies|company).*(most|top|highest|ranked?|maximum|max|list).*(voucher|sales)|"
+            r"(most|top|highest).*(voucher|sales).*(compan)|"
+            r"which compan.*(most|highest|top).*(voucher|sales)|"
+            r"rank.*compan.*voucher|list compan.*voucher|compan.*most.*created|"
+            r"top\s*\d*\s*compan.*(sales|voucher)|compan.*by.*(sales|voucher)|"
+            r"list.*compan.*(most|sales|voucher)|compan.*(created|having).*(sales|voucher)|"
+            r"show.*compan.*(sales|voucher)|compan.*with.*most.*(sales|voucher)|"
+            r"(sales|voucher).*(compan).*(list|rank|top|most)"
+        )
+        if db is not None and re.search(RANKING_PAT, q_low):
+            vtype = "purchase" if "purchase" in q_low else "sales"
+            nm = re.search(r"top\s+(\d+)", q_low)
+            lim = min(int(nm.group(1)), 50) if nm else 20
+            results, chart_sug = companies_by_voucher_count(db, vtype, lim)
+            results = [deep_sanitize(r) for r in results]
+            answer  = self._answer_company_ranking(results, question)
+            chart   = self._chart(results, chart_sug)
+            plan    = {"query_type":"direct","collection":"Voucher",
+                       "answer_template":"Companies ranked by sales vouchers.",
+                       "chart_suggestion":chart_sug,"clarification_needed":False}
+            self.history.append({"q":question,"a":plan["answer_template"]})
+            return {"type":"answer","answer":answer,"results":results,
+                    "chart":chart,"plan":plan,"db_error":None}
+
         # ── Step 2: Detect company name ────────────────────────────────────────
         cname   = extract_company_name(question)
         company = None
@@ -841,7 +925,13 @@ class MongoAIAgent:
                 plan    = {"query_type":"direct","collection":"Voucher",
                            "answer_template":f"Query for {company['name'] if company else 'all'}.",
                            "chart_suggestion":chart_sug,"clarification_needed":False}
-                answer  = self._answer(question, plan, results, None, company)
+
+                # For company-ranking results, build answer directly (no LLM - avoids ObjectId confusion)
+                if results and "voucher_count" in results[0] and "company" in results[0]:
+                    answer = self._answer_company_ranking(results, question)
+                else:
+                    answer = self._answer(question, plan, results, None, company)
+
                 chart   = self._chart(results, chart_sug)
                 self.history.append({"q":question,"a":plan["answer_template"][:80]})
                 return {"type":"answer","answer":answer,"results":results,
@@ -1020,6 +1110,36 @@ class MongoAIAgent:
 
         return None  # not handled — continue to normal pipeline
 
+    def _answer_company_ranking(self, results: List, question: str) -> str:
+        """Build a precise company ranking answer directly — no LLM, no ObjectId risk."""
+        if not results: return "No company data found."
+        top = results[:3]
+        total_vouchers = sum(r.get("voucher_count", 0) for r in results)
+
+        def fmt_amount(amt):
+            if not amt: return "₹0"
+            amt = float(amt)
+            if amt >= 1_00_00_000: return f"₹{amt/1_00_00_000:.2f} crore"
+            if amt >= 1_00_000:    return f"₹{amt/1_00_000:.2f} lakh"
+            return f"₹{amt:,.0f}"
+
+        lines = []
+        for i, r in enumerate(top, 1):
+            name   = r.get("company", "Unknown")
+            count  = r.get("voucher_count", 0)
+            amount = fmt_amount(r.get("total_amount", 0))
+            lines.append(f"**#{i} {name}** — {count:,} vouchers ({amount})")
+
+        top1 = top[0]
+        summary = (
+            f"The top {len(top)} companies by sales vouchers are:\n\n"
+            + "\n".join(lines)
+            + f"\n\n**{top1['company']}** leads with **{top1['voucher_count']:,} vouchers** "
+            + f"({fmt_amount(top1.get('total_amount',0))} total sales). "
+            + f"All {len(results)} companies together account for {total_vouchers:,} sales vouchers."
+        )
+        return summary
+
     def _answer(self, question, plan, results, err, company=None):
         if err:
             return f"⚠️ **Database error:** `{err}`"
@@ -1044,18 +1164,20 @@ class MongoAIAgent:
             return "**No records found.** Query ran but matched 0 documents."
 
         co = f" for **{company['name']}**" if company else ""
-        sc_note = (f"\n*(matched company: {company['name']})*" 
+        sc_note = (f"\n*(matched company: {company['name']})*"
                    if company and company.get("score",1.0) < 0.85 else "")
         prompt = (
             f"Invock ERP data analyst. Question: {question}{sc_note}\n"
             f"Company: {company['name'] if company else 'all companies'}\n\n"
             f"Data ({len(results)} records){co}:\n"
-            f"{json.dumps(results[:10], default=str, indent=2)}\n\n"
-            f"Write 2-3 precise sentences:\n"
-            f"1. Lead with the exact number/amount from data\n"
-            f"2. ₹ crore/lakh format (1Cr=10L=1,000,000)\n"
-            f"3. Name real top items from data\n"
-            f"4. ONE insight. ZERO invented numbers."
+            f"{json.dumps(results[:15], default=str, indent=2)}\n\n"
+            f"STRICT RULES:\n"
+            f"1. Use EXACT 'company' field values from data for company names — NEVER use ObjectId/hex strings\n"
+            f"2. voucher_count is a COUNT (whole number) — state it as '40,255 vouchers', not as lakhs\n"
+            f"3. total_amount is ₹ — format: X.XX crore or X.XX lakh (1 crore = 1,00,00,000)\n"
+            f"4. Lead with exact numbers from data for the top 3 entries\n"
+            f"5. ONE actionable business insight using real data only\n"
+            f"6. 2-3 sentences max. No hallucination. No approximations."
         )
         try: return self.llm.invoke([HumanMessage(content=prompt)]).content
         except: return f"Found {len(results)} record(s){co}."
