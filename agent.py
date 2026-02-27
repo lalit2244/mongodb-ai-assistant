@@ -756,11 +756,13 @@ class MongoAIAgent:
         self.llm        = None
         self.history    = []
         self.date_type  = "date_object"
-        self.stats      = {}
+        self.stats            = {}
+        self.collection_stats = {}
         if self.client:
             try:
                 self.date_type = detect_date_type(self.client)
-                self.stats     = get_stats(self.client)
+                self.stats            = get_stats(self.client)
+                self.collection_stats = self.stats
                 print(f"[Agent] Connected. issueDate={self.date_type}")
             except Exception as e:
                 print(f"[Agent] Init error: {e}")
@@ -770,7 +772,8 @@ class MongoAIAgent:
     def refresh_schema(self):
         if self.client:
             self.date_type = detect_date_type(self.client)
-            self.stats     = get_stats(self.client)
+            self.stats            = get_stats(self.client)
+            self.collection_stats = self.stats
 
     def init_llm(self):
         try: self.llm = get_llm(); return True
