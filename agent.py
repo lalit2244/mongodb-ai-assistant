@@ -1,8 +1,11 @@
 """
-MongoDB AI Agent — Invock ERP  (production-grade, fully direct-query)
+MongoDB AI Agent — Invock ERP  v4.0  (production-grade, fully direct-query)
 Every common question answered without LLM pipeline generation.
 LLM used ONLY for analysis text, never for building MongoDB filters.
 """
+AGENT_VERSION = "4.0"
+print(f"[Agent] Loading agent.py version {AGENT_VERSION}")
+
 import os, json, re, calendar
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
@@ -881,8 +884,29 @@ class MongoAIAgent:
             r"show.*compan.*(sales|voucher)|compan.*with.*most.*(sales|voucher)|"
             r"(sales|voucher).*(compan).*(list|rank|top|most)"
         )
-        if db is not None and re.search(RANKING_PAT, q_low):
+        # Also catch simple keyword combo: any question with 'compan' + ('voucher' or 'sales') + ('list' or 'most' or 'top')
+        words = set(q_low.split())
+        has_company  = any(w in q_low for w in ["compan"])
+        has_metric   = any(w in q_low for w in ["voucher","sales","invoice"])
+        has_rank     = any(w in q_low for w in ["list","most","top","highest","rank","maximum","best","created"])
+        is_ranking_q = re.search(RANKING_PAT, q_low) or (has_company and has_metric and has_rank)
+
+        if db is not None and is_ranking_q:
+            print(f"[Agent v4.0] Step 1b: company ranking query detected → '{question[:60]}'")
             vtype = "purchase" if "purchase" in q_low else "sales"
+            nm = re.search(r"top\s+(\d+)", q_low)
+            lim = min(int(nm.group(1)), 50) if nm else 20
+            results, chart_sug = companies_by_voucher_count(db, vtype, lim)
+            results = [deep_sanitize(r) for r in results]
+            answer  = self._answer_company_ranking(results, question)
+            chart   = self._chart(results, chart_sug)
+            plan    = {"query_type":"direct","collection":"Voucher",
+                       "answer_template":"Companies ranked by sales vouchers.",
+                       "chart_suggestion":chart_sug,"clarification_needed":False}
+            self.history.append({"q":question,"a":plan["answer_template"]})
+            return {"type":"answer","answer":answer,"results":results,
+                    "chart":chart,"plan":plan,"db_error":None}
+
             nm = re.search(r"top\s+(\d+)", q_low)
             lim = min(int(nm.group(1)), 50) if nm else 20
             results, chart_sug = companies_by_voucher_count(db, vtype, lim)
@@ -1113,32 +1137,47 @@ class MongoAIAgent:
     def _answer_company_ranking(self, results: List, question: str) -> str:
         """Build a precise company ranking answer directly — no LLM, no ObjectId risk."""
         if not results: return "No company data found."
-        top = results[:3]
+
+        # How many to show in text (top 3 unless user asked for more)
+        q = question.lower()
+        nm = re.search(r"top\s+(\d+|one|two|three|four|five|six|seven|eight|nine|ten)", q)
+        word_map = {"one":1,"two":2,"three":3,"four":4,"five":5,
+                    "six":6,"seven":7,"eight":8,"nine":9,"ten":10}
+        if nm:
+            w = nm.group(1)
+            n_show = int(w) if w.isdigit() else word_map.get(w, 3)
+        else:
+            n_show = 3
+
+        top = results[:n_show]
         total_vouchers = sum(r.get("voucher_count", 0) for r in results)
 
-        def fmt_amount(amt):
-            if not amt: return "₹0"
-            amt = float(amt)
+        def fmt_amt(amt):
+            """Format rupee amount — Voucher.billFinalAmount is in ₹ (not paise)."""
+            try: amt = float(amt or 0)
+            except: amt = 0.0
+            if amt <= 0:           return "₹0"
             if amt >= 1_00_00_000: return f"₹{amt/1_00_00_000:.2f} crore"
             if amt >= 1_00_000:    return f"₹{amt/1_00_000:.2f} lakh"
             return f"₹{amt:,.0f}"
 
         lines = []
         for i, r in enumerate(top, 1):
-            name   = r.get("company", "Unknown")
-            count  = r.get("voucher_count", 0)
-            amount = fmt_amount(r.get("total_amount", 0))
-            lines.append(f"**#{i} {name}** — {count:,} vouchers ({amount})")
+            name  = r.get("company", "Unknown")
+            count = int(r.get("voucher_count", 0))
+            amt   = fmt_amt(r.get("total_amount", 0))
+            lines.append(f"**#{i} {name}** — {count:,} vouchers ({amt} revenue)")
 
         top1 = top[0]
         summary = (
-            f"The top {len(top)} companies by sales vouchers are:\n\n"
+            f"**Top {n_show} companies by sales vouchers:**\n\n"
             + "\n".join(lines)
-            + f"\n\n**{top1['company']}** leads with **{top1['voucher_count']:,} vouchers** "
-            + f"({fmt_amount(top1.get('total_amount',0))} total sales). "
-            + f"All {len(results)} companies together account for {total_vouchers:,} sales vouchers."
+            + f"\n\n**{top1['company']}** leads with **{int(top1['voucher_count']):,} vouchers** "
+            + f"and {fmt_amt(top1.get('total_amount',0))} in sales. "
+            + f"Total across all {len(results)} companies: **{total_vouchers:,} vouchers**."
         )
         return summary
+
 
     def _answer(self, question, plan, results, err, company=None):
         if err:
@@ -1166,18 +1205,59 @@ class MongoAIAgent:
         co = f" for **{company['name']}**" if company else ""
         sc_note = (f"\n*(matched company: {company['name']})*"
                    if company and company.get("score",1.0) < 0.85 else "")
+
+        # ── Pure Python answer for single-metric results (no LLM) ─────────────
+        def fmt_inr(v):
+            try: v = float(v or 0)
+            except: v = 0.0
+            if v >= 1_00_00_000: return f"₹{v/1_00_00_000:.2f} crore"
+            if v >= 1_00_000:    return f"₹{v/1_00_000:.2f} lakh"
+            return f"₹{v:,.0f}"
+
+        if len(results) == 1:
+            row = results[0]
+            parts = []
+            for k, v in row.items():
+                if v in (None, "", []): continue
+                if isinstance(v, (int, float)):
+                    kl = k.lower()
+                    if any(x in kl for x in ["revenue","amount","sales","total","value","price"]):
+                        parts.append(f"**{k}**: {fmt_inr(v)}")
+                    elif any(x in kl for x in ["qty","quantity","count","voucher","order"]):
+                        parts.append(f"**{k}**: {int(v):,}")
+                    else:
+                        parts.append(f"**{k}**: {v:,}")
+                else:
+                    parts.append(f"**{k}**: {v}")
+            if parts:
+                co_label = f" for **{company['name']}**" if company else ""
+                return f"Result{co_label}:\n\n" + "\n".join(f"• {p}" for p in parts)
+
+        # ── LLM for multi-row analytical answers ─────────────────────────────
+        # Pre-format numeric fields so LLM never mis-formats them
+        formatted_preview = []
+        for r in results[:10]:
+            row_str = {}
+            for k, v in r.items():
+                if isinstance(v, (int, float)) and v:
+                    kl = k.lower()
+                    if any(x in kl for x in ["amount","revenue","total","price","value","sales"]):
+                        row_str[k] = fmt_inr(v)
+                    elif any(x in kl for x in ["count","qty","quantity","voucher","order"]):
+                        row_str[k] = f"{int(v):,}"
+                    else:
+                        row_str[k] = v
+                else:
+                    row_str[k] = v
+            formatted_preview.append(row_str)
+
         prompt = (
-            f"Invock ERP data analyst. Question: {question}{sc_note}\n"
+            f"Invock ERP analyst. Question: {question}{sc_note}\n"
             f"Company: {company['name'] if company else 'all companies'}\n\n"
-            f"Data ({len(results)} records){co}:\n"
-            f"{json.dumps(results[:15], default=str, indent=2)}\n\n"
-            f"STRICT RULES:\n"
-            f"1. Use EXACT 'company' field values from data for company names — NEVER use ObjectId/hex strings\n"
-            f"2. voucher_count is a COUNT (whole number) — state it as '40,255 vouchers', not as lakhs\n"
-            f"3. total_amount is ₹ — format: X.XX crore or X.XX lakh (1 crore = 1,00,00,000)\n"
-            f"4. Lead with exact numbers from data for the top 3 entries\n"
-            f"5. ONE actionable business insight using real data only\n"
-            f"6. 2-3 sentences max. No hallucination. No approximations."
+            f"Pre-formatted data ({len(results)} records){co}:\n"
+            f"{json.dumps(formatted_preview, default=str, indent=2)}\n\n"
+            f"RULES: Use EXACT values shown above. Do NOT re-convert or re-format numbers. "
+            f"2-3 sentences max. Name top items. One insight."
         )
         try: return self.llm.invoke([HumanMessage(content=prompt)]).content
         except: return f"Found {len(results)} record(s){co}."
