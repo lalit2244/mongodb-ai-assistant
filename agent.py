@@ -59,8 +59,25 @@ def detect_date_type(client) -> str:
     return "date_object"
 
 def get_stats(client):
-    cols = ["Voucher","Item","Business","ItemQuantityTracker","IUser","IBranch","ICompany"]
-    return {c: get_db(client)[c].count_documents({}) for c in cols}
+    db = get_db(client)
+    cols = {
+        "Voucher":              "Voucher",
+        "Item":                 "Item",
+        "Business":             "Business",
+        "ItemQuantityTracker":  "ItemQuantityTracker",
+        "Contact":              "Contact",
+        "Account":              "Account",
+        "IBranch":              "IBranch",
+        "IUser":                "IUser",
+        "ICompany":             "ICompany",
+    }
+    stats = {}
+    for key, col in cols.items():
+        try:
+            stats[key] = db[col].estimated_document_count()
+        except Exception:
+            stats[key] = 0
+    return stats
 
 # ═══════════════════════════ Date Helpers ═════════════════════════════════════
 
