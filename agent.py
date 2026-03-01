@@ -3,7 +3,7 @@ MongoDB AI Agent — Invock ERP  v4.0  (production-grade, fully direct-query)
 Every common question answered without LLM pipeline generation.
 LLM used ONLY for analysis text, never for building MongoDB filters.
 """
-AGENT_VERSION = "4.0"
+AGENT_VERSION = "4.1"
 print(f"[Agent] Loading agent.py version {AGENT_VERSION}")
 
 import os, json, re, calendar
@@ -865,85 +865,67 @@ class MongoAIAgent:
         except: return False
 
     def query(self, question: str) -> Dict:
+        # ── Version guard — if this prints wrong version, wrong file is loaded ──
+        assert AGENT_VERSION == "4.1", f"Wrong agent version: {AGENT_VERSION}"
+
         if not self.llm and not self.init_llm():
             return {"error": "GROQ_API_KEY not configured."}
 
         q_low = question.lower().strip()
         db    = get_db(self.client) if self.client else None
 
-        # ── Step 0: ObjectId lookup + collection-specific direct queries ──────
-        # Handles: "name of company with id 5d2eb70ce6e46c0014bb7af9"
-        #          "search in ICompany collection, name of company with id X"
-        #          "which branch has id X", "find voucher with id X", etc.
+        # ── Step 0: ObjectId / collection direct lookup ────────────────────────
         direct = self._direct_id_or_collection_query(question, db)
         if direct:
             return direct
 
-        # ── Step 1: Schema-level shortcut (no company) ────────────────────────
+        # ── Step 1: Global schema shortcuts (no company needed) ───────────────
         sc = schema_shortcut(q_low)
         if sc:
             results, err = execute_plan(sc, db, self.date_type)
             answer = self._answer(question, sc, results, err)
             chart  = self._chart(results, sc["chart_suggestion"])
-            self.history.append({"q":question,"a":sc["answer_template"][:80]})
+            self.history.append({"q": question, "a": sc["answer_template"][:80]})
             return {"type":"answer","answer":answer,"results":results,
                     "chart":chart,"plan":sc,"db_error":err}
 
-        # ── Step 1b: Company ranking shortcut (must run BEFORE extract_company_name) ──
-        # Catches: "list companies with most sales", "top 3 companies by vouchers", etc.
-        RANKING_PAT = (
-            r"(companies|company).*(most|top|highest|ranked?|maximum|max|list).*(voucher|sales)|"
-            r"(most|top|highest).*(voucher|sales).*(compan)|"
-            r"which compan.*(most|highest|top).*(voucher|sales)|"
-            r"rank.*compan.*voucher|list compan.*voucher|compan.*most.*created|"
-            r"top\s*\d*\s*compan.*(sales|voucher)|compan.*by.*(sales|voucher)|"
-            r"list.*compan.*(most|sales|voucher)|compan.*(created|having).*(sales|voucher)|"
-            r"show.*compan.*(sales|voucher)|compan.*with.*most.*(sales|voucher)|"
-            r"(sales|voucher).*(compan).*(list|rank|top|most)"
-        )
-        # Also catch simple keyword combo: any question with 'compan' + ('voucher' or 'sales') + ('list' or 'most' or 'top')
-        words = set(q_low.split())
-        has_company  = any(w in q_low for w in ["compan"])
-        has_metric   = any(w in q_low for w in ["voucher","sales","invoice"])
-        has_rank     = any(w in q_low for w in ["list","most","top","highest","rank","maximum","best","created"])
-        is_ranking_q = re.search(RANKING_PAT, q_low) or (has_company and has_metric and has_rank)
+        # ── Step 1b: Company ranking (BEFORE extract_company_name) ────────────
+        # Detects: "list companies with most sales vouchers", "top 3 companies by vouchers", etc.
+        _rp = (r"(companies|company).*(most|top|highest|ranked?|maximum|max|list).*(voucher|sales)|"
+               r"(most|top|highest).*(voucher|sales).*(compan)|"
+               r"which compan.*(most|highest|top).*(voucher|sales)|"
+               r"rank.*compan.*voucher|list compan.*voucher|compan.*most.*created|"
+               r"top\s*\d*\s*compan.*(sales|voucher)|compan.*by.*(sales|voucher)|"
+               r"list.*compan.*(most|sales|voucher)|compan.*(created|having).*(sales|voucher)|"
+               r"show.*compan.*(sales|voucher)|compan.*with.*most.*(sales|voucher)|"
+               r"(sales|voucher).*(compan).*(list|rank|top|most)")
+        _has_co  = "compan" in q_low
+        _has_met = any(w in q_low for w in ["voucher","sales","invoice"])
+        _has_rnk = any(w in q_low for w in ["list","most","top","highest","rank","maximum","best","created"])
+        _is_rank = bool(re.search(_rp, q_low)) or (_has_co and _has_met and _has_rnk)
 
-        if db is not None and is_ranking_q:
-            print(f"[Agent v4.0] Step 1b: company ranking query detected → '{question[:60]}'")
-            vtype = "purchase" if "purchase" in q_low else "sales"
-            nm = re.search(r"top\s+(\d+)", q_low)
-            lim = min(int(nm.group(1)), 50) if nm else 20
-            results, chart_sug = companies_by_voucher_count(db, vtype, lim)
+        if db is not None and _is_rank:
+            print(f"[v4.1] Step 1b → company ranking: '{question[:70]}'")
+            _vtype = "purchase" if "purchase" in q_low else "sales"
+            _nm    = re.search(r"top\s+(\d+)", q_low)
+            _lim   = min(int(_nm.group(1)), 50) if _nm else 20
+            results, chart_sug = companies_by_voucher_count(db, _vtype, _lim)
             results = [deep_sanitize(r) for r in results]
             answer  = self._answer_company_ranking(results, question)
             chart   = self._chart(results, chart_sug)
             plan    = {"query_type":"direct","collection":"Voucher",
                        "answer_template":"Companies ranked by sales vouchers.",
                        "chart_suggestion":chart_sug,"clarification_needed":False}
-            self.history.append({"q":question,"a":plan["answer_template"]})
+            self.history.append({"q": question, "a": plan["answer_template"]})
             return {"type":"answer","answer":answer,"results":results,
                     "chart":chart,"plan":plan,"db_error":None}
 
-            nm = re.search(r"top\s+(\d+)", q_low)
-            lim = min(int(nm.group(1)), 50) if nm else 20
-            results, chart_sug = companies_by_voucher_count(db, vtype, lim)
-            results = [deep_sanitize(r) for r in results]
-            answer  = self._answer_company_ranking(results, question)
-            chart   = self._chart(results, chart_sug)
-            plan    = {"query_type":"direct","collection":"Voucher",
-                       "answer_template":"Companies ranked by sales vouchers.",
-                       "chart_suggestion":chart_sug,"clarification_needed":False}
-            self.history.append({"q":question,"a":plan["answer_template"]})
-            return {"type":"answer","answer":answer,"results":results,
-                    "chart":chart,"plan":plan,"db_error":None}
-
-        # ── Step 2: Detect company name ────────────────────────────────────────
+        # ── Step 2: Extract + resolve company name ─────────────────────────────
         cname   = extract_company_name(question)
         company = None
         if cname and self.client:
             company = resolve_company(self.client, cname)
             if company is None:
-                # Try the whole question as company name too
                 company = resolve_company(self.client, question)
             if company is None:
                 return {
@@ -951,13 +933,13 @@ class MongoAIAgent:
                     "answer":(f"❌ No company matching **\"{cname}\"** found.\n\n"
                               f"**Top companies by sales:**\n"
                               f"• M/S DIPSHI - ESTIMATE (40,255 vouchers)\n"
-                              f"• HIRAKA JEWELS (34,998) • Bhakti Parshwanath (30,707)\n"
-                              f"• NAMO-ESTIMATE (27,478) • VAIBHAV FASHION (11,735)\n\n"
+                              f"• HIRAKA JEWELS (34,998)  •  Bhakti Parshwanath (30,707)\n"
+                              f"• NAMO-ESTIMATE (27,478)  •  VAIBHAV FASHION (11,735)\n\n"
                               f"Ask *\"list all companies\"* to see all 135 companies."),
                     "results":[],"chart":None,"plan":{},"db_error":None
                 }
 
-        # ── Step 3: Route to direct query (with or without company) ───────────
+        # ── Step 3: Intent router → 20+ direct query methods ─────────────────
         if db is not None:
             routed = route(question, company, db)
             if routed:
@@ -966,23 +948,20 @@ class MongoAIAgent:
                 plan    = {"query_type":"direct","collection":"Voucher",
                            "answer_template":f"Query for {company['name'] if company else 'all'}.",
                            "chart_suggestion":chart_sug,"clarification_needed":False}
-
-                # For company-ranking results, build answer directly (no LLM - avoids ObjectId confusion)
                 if results and "voucher_count" in results[0] and "company" in results[0]:
                     answer = self._answer_company_ranking(results, question)
                 else:
                     answer = self._answer(question, plan, results, None, company)
-
-                chart   = self._chart(results, chart_sug)
-                self.history.append({"q":question,"a":plan["answer_template"][:80]})
+                chart = self._chart(results, chart_sug)
+                self.history.append({"q": question, "a": plan["answer_template"][:80]})
                 return {"type":"answer","answer":answer,"results":results,
                         "chart":chart,"plan":plan,"db_error":None}
 
-        # ── Step 4: LLM fallback for unknown questions ─────────────────────────
+        # ── Step 4: LLM fallback for unknown questions ────────────────────────
         dates      = get_dates()
         sys_prompt = llm_prompt(dates)
-        hist       = ("\nPrev:\n" + "\n".join(f"Q:{h['q']}\nA:{h['a']}" for h in self.history[-3:])
-                      if self.history else "")
+        hist       = ("\nPrev:\n" + "\n".join(f"Q:{h['q']}\nA:{h['a']}"
+                       for h in self.history[-3:]) if self.history else "")
         user_msg   = f"{SCHEMA_TEXT}\n{hist}\n\nQuestion: {question}"
         try:
             resp = self.llm.invoke([SystemMessage(content=sys_prompt),
@@ -992,24 +971,23 @@ class MongoAIAgent:
             return {"error": f"LLM error: {e}"}
 
         results, err = execute_plan(plan, db, self.date_type)
-
-        # Retry once if empty/error
         if (not results or err) and plan.get("query_type") != "none":
             hint = (f"\n⚠️ Previous attempt failed: {err or 'empty results'}\n"
-                    f"Failed pipeline: {json.dumps(plan.get('pipeline'),default=str)[:200]}\n"
+                    f"Failed pipeline: {json.dumps(plan.get('pipeline'), default=str)[:200]}\n"
                     f"Fix: ensure $sum uses '$fieldName' format. Try simpler query.")
             try:
                 resp2 = self.llm.invoke([SystemMessage(content=sys_prompt),
-                                          HumanMessage(content=user_msg+hint)])
+                                         HumanMessage(content=user_msg + hint)])
                 plan  = parse_plan(resp2.content)
                 results, err = execute_plan(plan, db, self.date_type)
             except: pass
 
         answer = self._answer(question, plan, results, err, company)
-        chart  = self._chart(results, plan.get("chart_suggestion",{}))
-        self.history.append({"q":question,"a":plan.get("answer_template","")[:80]})
+        chart  = self._chart(results, plan.get("chart_suggestion", {}))
+        self.history.append({"q": question, "a": plan.get("answer_template","")[:80]})
         return {"type":"answer","answer":answer,"results":results,
                 "chart":chart,"plan":plan,"db_error":err}
+
 
     def _direct_id_or_collection_query(self, question: str, db) -> Optional[Dict]:
         """
@@ -1223,58 +1201,78 @@ class MongoAIAgent:
         sc_note = (f"\n*(matched company: {company['name']})*"
                    if company and company.get("score",1.0) < 0.85 else "")
 
-        # ── Pure Python answer for single-metric results (no LLM) ─────────────
-        def fmt_inr(v):
-            try: v = float(v or 0)
-            except: v = 0.0
-            if v >= 1_00_00_000: return f"₹{v/1_00_00_000:.2f} crore"
-            if v >= 1_00_000:    return f"₹{v/1_00_000:.2f} lakh"
-            return f"₹{v:,.0f}"
+        # ── Universal formatters (used everywhere — no LLM for numbers) ────────
+        # ALL monetary field keywords — any field whose name contains these
+        MONEY_KEYS = {"amount","revenue","total","price","value","sales","due",
+                      "paid","balance","bill","final","cost","tax","discount",
+                      "subtotal","net","gross","fee","charge","credit","debit"}
+        # ALL count/quantity field keywords
+        COUNT_KEYS = {"count","qty","quantity","voucher","order","invoice",
+                      "unit","number","num","no","record","item","stock"}
 
-        if len(results) == 1:
-            row = results[0]
-            parts = []
+        def fmt_inr(v):
+            """Format rupee amount. Voucher amounts are in ₹ (not paise)."""
+            try: v = float(v or 0)
+            except: return str(v)
+            if v <= 0:             return "₹0"
+            if v >= 1_00_00_000:
+                crore = v / 1_00_00_000
+                return f"₹{crore:,.2f} crore"
+            if v >= 1_00_000:
+                lakh = v / 1_00_000
+                return f"₹{lakh:,.2f} lakh"
+            if v >= 1_000:         return f"₹{v:,.0f}"
+            return f"₹{v:.2f}"
+
+        def is_money(field_name):
+            fl = field_name.lower()
+            return any(k in fl for k in MONEY_KEYS)
+
+        def is_count(field_name):
+            fl = field_name.lower()
+            return any(k in fl for k in COUNT_KEYS)
+
+        def fmt_row(row: dict) -> dict:
+            """Pre-format every field in a result row."""
+            out = {}
             for k, v in row.items():
-                if v in (None, "", []): continue
+                if v in (None, "", [], {}):
+                    continue
                 if isinstance(v, (int, float)):
-                    kl = k.lower()
-                    if any(x in kl for x in ["revenue","amount","sales","total","value","price"]):
-                        parts.append(f"**{k}**: {fmt_inr(v)}")
-                    elif any(x in kl for x in ["qty","quantity","count","voucher","order"]):
-                        parts.append(f"**{k}**: {int(v):,}")
+                    # COUNT check first — qty/count fields should never be formatted as money
+                    if is_count(k) and not is_money(k.replace("total_","").replace("_total","")):
+                        out[k] = f"{int(v):,}"
+                    elif is_money(k):
+                        out[k] = fmt_inr(v)
+                    elif is_count(k):
+                        out[k] = f"{int(v):,}"
                     else:
-                        parts.append(f"**{k}**: {v:,}")
+                        out[k] = v
                 else:
-                    parts.append(f"**{k}**: {v}")
+                    out[k] = v
+            return out
+
+        # ── Pure Python answer for single-metric results (no LLM) ─────────────
+        if len(results) == 1:
+            row = fmt_row(results[0])
+            parts = [f"**{k}**: {v}" for k, v in row.items()]
             if parts:
                 co_label = f" for **{company['name']}**" if company else ""
                 return f"Result{co_label}:\n\n" + "\n".join(f"• {p}" for p in parts)
 
-        # ── LLM for multi-row analytical answers ─────────────────────────────
-        # Pre-format numeric fields so LLM never mis-formats them
-        formatted_preview = []
-        for r in results[:10]:
-            row_str = {}
-            for k, v in r.items():
-                if isinstance(v, (int, float)) and v:
-                    kl = k.lower()
-                    if any(x in kl for x in ["amount","revenue","total","price","value","sales"]):
-                        row_str[k] = fmt_inr(v)
-                    elif any(x in kl for x in ["count","qty","quantity","voucher","order"]):
-                        row_str[k] = f"{int(v):,}"
-                    else:
-                        row_str[k] = v
-                else:
-                    row_str[k] = v
-            formatted_preview.append(row_str)
+        # ── Pre-format ALL rows before LLM sees them ──────────────────────────
+        formatted_preview = [fmt_row(r) for r in results[:10]]
 
         prompt = (
             f"Invock ERP analyst. Question: {question}{sc_note}\n"
             f"Company: {company['name'] if company else 'all companies'}\n\n"
-            f"Pre-formatted data ({len(results)} records){co}:\n"
+            f"Data ({len(results)} records){co} — ALL amounts already formatted in ₹:\n"
             f"{json.dumps(formatted_preview, default=str, indent=2)}\n\n"
-            f"RULES: Use EXACT values shown above. Do NOT re-convert or re-format numbers. "
-            f"2-3 sentences max. Name top items. One insight."
+            f"STRICT RULES:\n"
+            f"1. Copy amounts EXACTLY as shown — they are already correctly formatted\n"
+            f"2. NEVER re-convert, re-scale, or re-format any number\n"
+            f"3. Name specific voucher numbers, customer names, or product names from data\n"
+            f"4. 2-3 sentences. One business insight. No invented numbers."
         )
         try: return self.llm.invoke([HumanMessage(content=prompt)]).content
         except: return f"Found {len(results)} record(s){co}."
