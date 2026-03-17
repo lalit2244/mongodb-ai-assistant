@@ -9,7 +9,7 @@ Root causes fixed in v4.4:
   4. Item collection also uses $in filter
   5. resolve_company() now returns both obj_id and str_id always
 """
-AGENT_VERSION = "4.4"
+AGENT_VERSION = "4.5"
 print(f"[Agent] Loading agent.py version {AGENT_VERSION}")
 
 import os, json, re, calendar
@@ -159,19 +159,21 @@ def cid_filter(obj_id, str_id) -> dict:
     """
     THE ONE TRUE FILTER for iCompanyId across ALL collections.
 
-    Never assume ObjectId vs string — use $in:[ObjectId, string].
+    CRITICAL: Always include BOTH ObjectId and string forms.
+    str(ObjectId('651...')) == '651...' is always True — so do NOT use
+    an inequality check to decide whether to add the string.
+    Both must be explicitly added so MongoDB matches regardless of
+    how iCompanyId was stored (ObjectId or plain string).
+
     Works for Voucher, ItemQuantityTracker, Business, Item, Account.
-    Zero false negatives. MongoDB index scan handles both values efficiently.
     """
     if obj_id is None and str_id is None:
         return {}
     vals = []
     if obj_id is not None:
-        vals.append(obj_id)
-    if str_id is not None and str_id != str(obj_id):
-        vals.append(str_id)
-    elif str_id is not None and obj_id is None:
-        vals.append(str_id)
+        vals.append(obj_id)   # ObjectId form — matches ObjectId-stored docs
+    if str_id is not None:
+        vals.append(str_id)   # string form  — ALWAYS add, matches string-stored docs
     return {"iCompanyId": {"$in": vals}}
 
 # ═══════════════════════════ Company Resolver ═════════════════════════════════
@@ -873,7 +875,7 @@ class MongoAIAgent:
         except: return False
 
     def query(self, question: str) -> Dict:
-        assert AGENT_VERSION == "4.4", f"Wrong agent version: {AGENT_VERSION}"
+        assert AGENT_VERSION == "4.5", f"Wrong agent version: {AGENT_VERSION}"
 
         if not self.llm and not self.init_llm():
             return {"error": "GROQ_API_KEY not configured."}
