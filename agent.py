@@ -9,7 +9,7 @@ Root causes fixed in v4.4:
   4. Item collection also uses $in filter
   5. resolve_company() now returns both obj_id and str_id always
 """
-AGENT_VERSION = "4.9"
+AGENT_VERSION = "4.10"
 print(f"[Agent] Loading agent.py version {AGENT_VERSION}")
 
 import os, json, re, calendar
@@ -253,6 +253,10 @@ def extract_company_name(question: str) -> Optional[str]:
         r"(?:vouchers?|sales?|purchases?|records?|revenue|invoices?)\s+(?:in|of|for|from)\s+['\"]?([A-Za-z0-9][A-Za-z0-9 /\-&.']{2,40}?)['\"]?\s*(?:\?|$|\.|,)",
         r"([A-Za-z0-9][A-Za-z0-9 /\-&.']{2,40}?)(?:'s)\s+(?:vouchers?|sales?|data|revenue|customers?)",
         r"(?:of|for)\s+([A-Za-z0-9][A-Za-z0-9 /\-&.']{2,50}?)\s*$",
+        r"does\s+([A-Za-z0-9][A-Za-z0-9 /\-&.']{2,50}?)\s+have",
+        r"(?:customers?|suppliers?|vouchers?|sales?|stock|revenue|trend|products?)\s+(?:does|of|for)\s+([A-Za-z0-9][A-Za-z0-9 /\-&.']{2,50}?)(?:\s*\?|$)",
+        r"([A-Za-z0-9][A-Za-z0-9 /\-&.']{2,50}?)\s+(?:has|have|had)\s+(?:how many|\d)",
+        r"(?:show|get|give|tell)\s+(?:me\s+)?(?:the\s+)?(?:sales?|revenue|customers?|vouchers?|trend|stock|purchases?)\s+(?:of|for)\s+([A-Za-z0-9][A-Za-z0-9 /\-&.']{2,50}?)\s*(?:\?|$)",
     ]
     stopwords = {"company","the","a","an","in","for","of","with","has","have","me","my",
                  "all","this","that","these","those","its","their","collection","icompany",
@@ -883,7 +887,7 @@ class MongoAIAgent:
         except: return False
 
     def query(self, question: str) -> Dict:
-        assert AGENT_VERSION == "4.9", f"Wrong agent version: {AGENT_VERSION}"
+        assert AGENT_VERSION == "4.10", f"Wrong agent version: {AGENT_VERSION}"
 
         if not self.llm and not self.init_llm():
             return {"error": "GROQ_API_KEY not configured."}
