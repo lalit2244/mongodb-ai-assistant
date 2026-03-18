@@ -9,7 +9,7 @@ Root causes fixed in v4.4:
   4. Item collection also uses $in filter
   5. resolve_company() now returns both obj_id and str_id always
 """
-AGENT_VERSION = "4.5"
+AGENT_VERSION = "4.6"
 print(f"[Agent] Loading agent.py version {AGENT_VERSION}")
 
 import os, json, re, calendar
@@ -875,7 +875,7 @@ class MongoAIAgent:
         except: return False
 
     def query(self, question: str) -> Dict:
-        assert AGENT_VERSION == "4.5", f"Wrong agent version: {AGENT_VERSION}"
+        assert AGENT_VERSION == "4.6", f"Wrong agent version: {AGENT_VERSION}"
 
         if not self.llm and not self.init_llm():
             return {"error": "GROQ_API_KEY not configured."}
@@ -888,17 +888,33 @@ class MongoAIAgent:
         if direct:
             return direct
 
-        # ── Step 1: Global schema shortcuts ───────────────────────────────────
-        sc = schema_shortcut(q_low)
-        if sc:
-            results, err = execute_plan(sc, db, self.date_type)
-            answer = self._answer(question, sc, results, err)
-            chart  = self._chart(results, sc["chart_suggestion"])
-            self.history.append({"q": question, "a": sc["answer_template"][:80]})
-            return {"type":"answer","answer":answer,"results":results,
-                    "chart":chart,"plan":sc,"db_error":err}
+        # ── Step 1: Resolve company FIRST ─────────────────────────────────────
+        # CRITICAL: must happen before schema_shortcut so company-specific
+        # questions like "top customers of CJ Enterprises" never hit the
+        # global unfiltered schema_shortcut path.
+        company = None
 
-        # ── Step 1b: Company ranking ───────────────────────────────────────────
+        # 1a: Hex ID in question + analytics keywords → resolve directly
+        hex_match = re.search(r'\b([0-9a-fA-F]{24})\b', question)
+        if hex_match and self.client and _ANALYTICS_KW.search(question):
+            company = resolve_company_by_hex(self.client, hex_match.group(1))
+
+        # 1b: Fuzzy company name extraction
+        if company is None:
+            cname = extract_company_name(question)
+            if cname and self.client:
+                company = resolve_company(self.client, cname)
+                if company is None:
+                    company = resolve_company(self.client, question)
+                if company is None:
+                    return {
+                        "type":"answer",
+                        "answer":(f"❌ No company matching **\"{cname}\"** found.\n\n"
+                                  f"Ask *\"list all companies\"* to see all available companies."),
+                        "results":[],"chart":None,"plan":{},"db_error":None
+                    }
+
+        # ── Step 2: Company ranking (global, no company filter needed) ────────
         _rp = (r"(companies|company).*(most|top|highest|ranked?|maximum|max|list).*(voucher|sales)|"
                r"(most|top|highest).*(voucher|sales).*(compan)|"
                r"top\s*\d*\s*compan.*(sales|voucher)|compan.*by.*(sales|voucher)|"
@@ -921,27 +937,20 @@ class MongoAIAgent:
             return {"type":"answer","answer":answer,"results":results,
                     "chart":chart,"plan":plan,"db_error":None}
 
-        # ── Step 2: Resolve company ────────────────────────────────────────────
-        company = None
-        hex_match = re.search(r'\b([0-9a-fA-F]{24})\b', question)
-        if hex_match and self.client and _ANALYTICS_KW.search(question):
-            company = resolve_company_by_hex(self.client, hex_match.group(1))
-
+        # ── Step 3: Global schema shortcuts (ONLY when no company detected) ───
+        # If a company was found in Step 1, skip this entirely so we never
+        # return unfiltered global data for a company-specific question.
         if company is None:
-            cname = extract_company_name(question)
-            if cname and self.client:
-                company = resolve_company(self.client, cname)
-                if company is None:
-                    company = resolve_company(self.client, question)
-                if company is None:
-                    return {
-                        "type":"answer",
-                        "answer":(f"❌ No company matching **\"{cname}\"** found.\n\n"
-                                  f"Ask *\"list all companies\"* to see all available companies."),
-                        "results":[],"chart":None,"plan":{},"db_error":None
-                    }
+            sc = schema_shortcut(q_low)
+            if sc:
+                results, err = execute_plan(sc, db, self.date_type)
+                answer = self._answer(question, sc, results, err)
+                chart  = self._chart(results, sc["chart_suggestion"])
+                self.history.append({"q": question, "a": sc["answer_template"][:80]})
+                return {"type":"answer","answer":answer,"results":results,
+                        "chart":chart,"plan":sc,"db_error":err}
 
-        # ── Step 3: Intent router ─────────────────────────────────────────────
+        # ── Step 4: Intent router (company-aware) ─────────────────────────────
         if db is not None:
             routed = route(question, company, db)
             if routed:
@@ -959,7 +968,7 @@ class MongoAIAgent:
                 return {"type":"answer","answer":answer,"results":results,
                         "chart":chart,"plan":plan,"db_error":None}
 
-        # ── Step 4: LLM fallback ──────────────────────────────────────────────
+        # ── Step 5: LLM fallback ──────────────────────────────────────────────
         dates      = get_dates()
         sys_prompt = llm_prompt(dates)
         hist       = ("\nPrev:\n" + "\n".join(f"Q:{h['q']}\nA:{h['a']}"
