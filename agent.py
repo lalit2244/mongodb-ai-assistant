@@ -9,7 +9,7 @@ Root causes fixed in v4.4:
   4. Item collection also uses $in filter
   5. resolve_company() now returns both obj_id and str_id always
 """
-AGENT_VERSION = "4.10"
+AGENT_VERSION = "4.11"
 print(f"[Agent] Loading agent.py version {AGENT_VERSION}")
 
 import os, json, re, calendar
@@ -404,24 +404,32 @@ class Q:
                       "title":f"{name} — Monthly Sales Trend"}
 
     def total_revenue(self, year=None, name="Company"):
-        d     = get_dates()
-        match = {"voucherType":"sales"}
-        # FIX: only apply year filter for GLOBAL queries (no company)
-        # For company-specific queries, return ALL TIME so user sees full picture
-        if year and not self.company:
-            match["year"] = year
-        elif year and self.company:
-            # Only add year filter if explicitly requested by user
-            match["year"] = year
-        # If no year specified and company given → no year filter (all time)
-        rows = agg(self.db,"ItemQuantityTracker",[
-            {"$match": self._mf(match)},
-            {"$group": {"_id":None,"total_revenue":{"$sum":"$amount"},"total_qty":{"$sum":"$qty"}}},
-            {"$project":{"_id":0,"total_revenue":1,"total_qty":1}}
-        ])
-        label = f"{year}" if year else ("All Time" if self.company else str(d["ty"]))
-        return rows, {"type":"metric","x_field":None,"y_field":"total_revenue",
-                      "title":f"{name} — Revenue ({label})"}
+        d = get_dates()
+        if self.company:
+            # Company-specific: use Voucher.billFinalAmount — this is the
+            # FINAL billed amount (includes taxes, charges) — most accurate
+            # and consistent with what Invock ERP shows on reports
+            mf = self._mf({"type":"sales"})
+            rows = agg(self.db,"Voucher",[
+                {"$match": mf},
+                {"$group": {"_id":None,
+                            "total_revenue":{"$sum":"$billFinalAmount"},
+                            "total_vouchers":{"$sum":1}}},
+                {"$project":{"_id":0,"total_revenue":1,"total_vouchers":1}}
+            ])
+            return rows, {"type":"metric","x_field":None,"y_field":"total_revenue",
+                          "title":f"{name} — Total Sales Revenue"}
+        else:
+            # Global query: use ItemQuantityTracker with year filter
+            match = {"voucherType":"sales","year": year or d["ty"]}
+            rows = agg(self.db,"ItemQuantityTracker",[
+                {"$match": self._mf(match)},
+                {"$group": {"_id":None,"total_revenue":{"$sum":"$amount"},"total_qty":{"$sum":"$qty"}}},
+                {"$project":{"_id":0,"total_revenue":1,"total_qty":1}}
+            ])
+            label = str(year or d["ty"])
+            return rows, {"type":"metric","x_field":None,"y_field":"total_revenue",
+                          "title":f"{name} — Revenue ({label})"}
 
     def top_products(self, by="amount", limit=15, name="Company"):
         d  = get_dates()
@@ -887,7 +895,7 @@ class MongoAIAgent:
         except: return False
 
     def query(self, question: str) -> Dict:
-        assert AGENT_VERSION == "4.10", f"Wrong agent version: {AGENT_VERSION}"
+        assert AGENT_VERSION == "4.11", f"Wrong agent version: {AGENT_VERSION}"
 
         if not self.llm and not self.init_llm():
             return {"error": "GROQ_API_KEY not configured."}
