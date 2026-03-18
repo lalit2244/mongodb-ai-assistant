@@ -9,7 +9,7 @@ Root causes fixed in v4.4:
   4. Item collection also uses $in filter
   5. resolve_company() now returns both obj_id and str_id always
 """
-AGENT_VERSION = "4.7"
+AGENT_VERSION = "4.8"
 print(f"[Agent] Loading agent.py version {AGENT_VERSION}")
 
 import os, json, re, calendar
@@ -672,10 +672,16 @@ def schema_shortcut(q: str) -> Optional[Dict]:
             proj={"_id":0,"name":1,"phone":1,"lastSignIn":1},
             limit=500,tmpl="All users.",ct="table",title="All Users")
 
-    if re.search(r"^(list |show |get |how many )?(all )?compan", q) and miss("with","in company","for","sales","voucher","most","top","rank"):
+    if re.search(r"^(list |show |get )?(all )?compan", q) and miss("with","in company","for","sales","voucher","most","top","rank"):
         return plan("find","ICompany",fq={},
             proj={"_id":0,"name":1,"industry":1,"financialYear":1},
             limit=200,tmpl="All companies.",ct="table",title="All Companies")
+
+    if re.search(r"how many compan", q) and miss("with","in","for","sales","voucher","most","top","rank"):
+        return plan("aggregate","ICompany",
+            pipe=[{"$count":"total_companies"}],
+            tmpl="Total companies.",ct="metric",y="total_companies",
+            title="Total Companies")
 
     if re.search(r"monthly.*trend|trend.*month|last 12 month|12 month|month.*wise", q) and miss("company","with","in","for","purchase"):
         return plan("aggregate","ItemQuantityTracker",
@@ -877,7 +883,7 @@ class MongoAIAgent:
         except: return False
 
     def query(self, question: str) -> Dict:
-        assert AGENT_VERSION == "4.7", f"Wrong agent version: {AGENT_VERSION}"
+        assert AGENT_VERSION == "4.8", f"Wrong agent version: {AGENT_VERSION}"
 
         if not self.llm and not self.init_llm():
             return {"error": "GROQ_API_KEY not configured."}
@@ -890,33 +896,10 @@ class MongoAIAgent:
         if direct:
             return direct
 
-        # ── Step 1: Resolve company FIRST ─────────────────────────────────────
-        # CRITICAL: must happen before schema_shortcut so company-specific
-        # questions like "top customers of CJ Enterprises" never hit the
-        # global unfiltered schema_shortcut path.
-        company = None
-
-        # 1a: Hex ID in question + analytics keywords → resolve directly
-        hex_match = re.search(r'\b([0-9a-fA-F]{24})\b', question)
-        if hex_match and self.client and _ANALYTICS_KW.search(question):
-            company = resolve_company_by_hex(self.client, hex_match.group(1))
-
-        # 1b: Fuzzy company name extraction
-        if company is None:
-            cname = extract_company_name(question)
-            if cname and self.client:
-                company = resolve_company(self.client, cname)
-                if company is None:
-                    company = resolve_company(self.client, question)
-                if company is None:
-                    return {
-                        "type":"answer",
-                        "answer":(f"❌ No company matching **\"{cname}\"** found.\n\n"
-                                  f"Ask *\"list all companies\"* to see all available companies."),
-                        "results":[],"chart":None,"plan":{},"db_error":None
-                    }
-
-        # ── Step 2: Company ranking (global, no company filter needed) ────────
+        # ── Step 1: Company ranking — MUST run before company resolution ────────
+        # "top 5 companies by sales vouchers" contains "compan" which would
+        # accidentally fuzzy-match a company name if resolution ran first.
+        # Company ranking is a GLOBAL query — no company filter needed.
         _rp = (r"(companies|company).*(most|top|highest|ranked?|maximum|max|list).*(voucher|sales)|"
                r"(most|top|highest).*(voucher|sales).*(compan)|"
                r"top\s*\d*\s*compan.*(sales|voucher)|compan.*by.*(sales|voucher)|"
@@ -938,6 +921,32 @@ class MongoAIAgent:
             self.history.append({"q": question, "a": plan["answer_template"]})
             return {"type":"answer","answer":answer,"results":results,
                     "chart":chart,"plan":plan,"db_error":None}
+
+        # ── Step 2: Resolve company (after ranking check) ────────────────────
+        # Only runs if question is NOT a global ranking query.
+        # FIX: removed aggressive fallback resolve_company(client, question)
+        # that was fuzzy-matching company names from generic questions.
+        company = None
+
+        # 2a: Hex ID in question + analytics keywords → resolve directly
+        hex_match = re.search(r'\b([0-9a-fA-F]{24})\b', question)
+        if hex_match and self.client and _ANALYTICS_KW.search(question):
+            company = resolve_company_by_hex(self.client, hex_match.group(1))
+
+        # 2b: Fuzzy company name extraction from question
+        if company is None:
+            cname = extract_company_name(question)
+            if cname and self.client:
+                company = resolve_company(self.client, cname)
+                # NOTE: removed fallback resolve_company(client, full_question)
+                # that was accidentally matching generic words as company names
+                if company is None:
+                    return {
+                        "type":"answer",
+                        "answer":(f"❌ No company matching **\"{cname}\"** found.\n\n"
+                                  f"Ask *\"list all companies\"* to see all available companies."),
+                        "results":[],"chart":None,"plan":{},"db_error":None
+                    }
 
         # ── Step 3: Global schema shortcuts (ONLY when no company detected) ───
         # If a company was found in Step 1, skip this entirely so we never
