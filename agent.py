@@ -9,7 +9,7 @@ Root causes fixed in v4.4:
   4. Item collection also uses $in filter
   5. resolve_company() now returns both obj_id and str_id always
 """
-AGENT_VERSION = "4.8"
+AGENT_VERSION = "4.9"
 print(f"[Agent] Loading agent.py version {AGENT_VERSION}")
 
 import os, json, re, calendar
@@ -883,7 +883,7 @@ class MongoAIAgent:
         except: return False
 
     def query(self, question: str) -> Dict:
-        assert AGENT_VERSION == "4.8", f"Wrong agent version: {AGENT_VERSION}"
+        assert AGENT_VERSION == "4.9", f"Wrong agent version: {AGENT_VERSION}"
 
         if not self.llm and not self.init_llm():
             return {"error": "GROQ_API_KEY not configured."}
@@ -907,7 +907,7 @@ class MongoAIAgent:
         _has_co  = "compan" in q_low
         _has_met = any(w in q_low for w in ["voucher","sales","invoice"])
         _has_rnk = any(w in q_low for w in ["list","most","top","highest","rank","maximum","best"])
-        if (bool(re.search(_rp, q_low)) or (_has_co and _has_met and _has_rnk)) and db:
+        if (bool(re.search(_rp, q_low)) or (_has_co and _has_met and _has_rnk)) and db is not None:
             _vtype = "purchase" if "purchase" in q_low else "sales"
             _nm    = re.search(r"top\s+(\d+)", q_low)
             _lim   = min(int(_nm.group(1)), 50) if _nm else 20
