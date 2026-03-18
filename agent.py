@@ -9,7 +9,7 @@ Root causes fixed in v4.4:
   4. Item collection also uses $in filter
   5. resolve_company() now returns both obj_id and str_id always
 """
-AGENT_VERSION = "4.6"
+AGENT_VERSION = "4.7"
 print(f"[Agent] Loading agent.py version {AGENT_VERSION}")
 
 import os, json, re, calendar
@@ -600,12 +600,14 @@ def route(question: str, company: Optional[Dict], db) -> Optional[Tuple]:
     if re.search(r"list.*customer|show.*customer|all.*customer|customer.*list|"
                  r"how many.*customer|count.*customer|number.*customer", q):
         if re.search(r"how many|count|number", q):
-            cf = qb._cf()
-            match = {"relationType":{"$in":["customer","both"]}}
-            match.update(cf)
-            rows = agg(db,"Business",[{"$match":match},{"$count":"total_customers"}])
+            # Use Voucher party.name distinct — Voucher $in filter proven correct
+            rows = agg(db,"Voucher",[
+                {"$match": qb._mf({"type":"sales","party.name":{"$ne":None}})},
+                {"$group": {"_id":"$party.name"}},
+                {"$count": "total_customers"}
+            ])
             return rows, {"type":"metric","x_field":None,"y_field":"total_customers",
-                          "title":f"{n} — Total Customers"}
+                          "title":f"{n} — Total Unique Customers"}
         return qb.customer_list(n)
 
     # ── Supplier list / count ─────────────────────────────────────────────────
@@ -875,7 +877,7 @@ class MongoAIAgent:
         except: return False
 
     def query(self, question: str) -> Dict:
-        assert AGENT_VERSION == "4.6", f"Wrong agent version: {AGENT_VERSION}"
+        assert AGENT_VERSION == "4.7", f"Wrong agent version: {AGENT_VERSION}"
 
         if not self.llm and not self.init_llm():
             return {"error": "GROQ_API_KEY not configured."}
@@ -1117,7 +1119,7 @@ class MongoAIAgent:
                  f"({fmt_amt(r.get('total_amount',0))})"
                  for i, r in enumerate(top, 1)]
         top1 = top[0]
-        return (f"**Top {n_show} companies by {results[0].get('type','sales')} vouchers:**\n\n"
+        return (f"**Top {n_show} companies by sales vouchers:**\n\n"
                 + "\n".join(lines)
                 + f"\n\n**{top1['company']}** leads with **{int(top1['voucher_count']):,} vouchers**. "
                 + f"Total across all {len(results)} companies: **{total_vouchers:,} vouchers**.")
