@@ -9,7 +9,7 @@ Root causes fixed in v4.4:
   4. Item collection also uses $in filter
   5. resolve_company() now returns both obj_id and str_id always
 """
-AGENT_VERSION = "4.20"
+AGENT_VERSION = "4.21"
 print(f"[Agent] Loading agent.py version {AGENT_VERSION}")
 
 import os, json, re, calendar
@@ -588,12 +588,14 @@ def route(question: str, company: Optional[Dict], db) -> Optional[Tuple]:
             _end   = datetime(_y, _m, _cal.monthrange(_y, _m)[1], 23, 59, 59)
             if has("list","show","give","all") and has("voucher","invoice","bill"):
                 # List individual vouchers for this month
-                mf = qb._mf({"type":"sales" if not has("purchase") else "purchase",
+                _vt = "purchase" if has("purchase") else "sales"
+                mf = qb._mf({"type":_vt,
+                             "billFinalAmount":{"$gt":0},
                              "issueDate":{"$gte":_start,"$lte":_end}})
                 rows = find(db,"Voucher",mf,
                     proj={"_id":0,"voucherNo":1,"issueDate":1,"billFinalAmount":1,
-                          "status":1,"party.name":1},
-                    sort=[("issueDate",1)],limit=50)
+                          "dueAmount":1,"status":1,"party.name":1},
+                    sort=[("issueDate",1)],limit=100)
                 mon_label = _cal.month_name[_m]
                 return rows, {"type":"table","x_field":"voucherNo","y_field":"billFinalAmount",
                               "title":f"{n} — Vouchers {mon_label} {_y}"}
@@ -879,13 +881,15 @@ def schema_shortcut(q: str) -> Optional[Dict]:
             _start = _dt.datetime(_y, _m, 1)
             _end   = _dt.datetime(_y, _m, _cal.monthrange(_y, _m)[1], 23, 59, 59)
             return plan("find","Voucher",
-                fq={"type":_vtype,"issueDate":{"$gte":_start,"$lte":_end}},
+                fq={"type":_vtype,
+                    "billFinalAmount":{"$gt":0},
+                    "issueDate":{"$gte":_start,"$lte":_end}},
                 proj={"_id":0,"voucherNo":1,"issueDate":1,"billFinalAmount":1,
-                      "status":1,"party.name":1,"type":1},
-                sort={"issueDate":1},limit=50,
-                tmpl=f"Sales vouchers for {_cal.month_name[_m]} {_y}.",
+                      "dueAmount":1,"status":1,"party.name":1},
+                sort={"issueDate":1},limit=100,
+                tmpl=f"{_vtype.title()} vouchers for {_cal.month_name[_m]} {_y}.",
                 ct="table",x="voucherNo",y="billFinalAmount",
-                title=f"Sales Vouchers — {_cal.month_name[_m]} {_y}")
+                title=f"{_vtype.title()} Vouchers — {_cal.month_name[_m]} {_y}")
 
     if re.search(r"how many (customer|supplier|client)", q) and miss("company","with","in"):
         rel   = "customer" if "customer" in q or "client" in q else "supplier"
@@ -1117,7 +1121,7 @@ class MongoAIAgent:
         except: return False
 
     def query(self, question: str) -> Dict:
-        assert AGENT_VERSION == "4.20", f"Wrong agent version: {AGENT_VERSION}"
+        assert AGENT_VERSION == "4.21", f"Wrong agent version: {AGENT_VERSION}"
 
         if not self.llm and not self.init_llm():
             return {"error": "GROQ_API_KEY not configured."}
