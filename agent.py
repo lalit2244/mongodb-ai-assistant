@@ -9,7 +9,7 @@ Root causes fixed in v4.4:
   4. Item collection also uses $in filter
   5. resolve_company() now returns both obj_id and str_id always
 """
-AGENT_VERSION = "4.21"
+AGENT_VERSION = "4.22"
 print(f"[Agent] Loading agent.py version {AGENT_VERSION}")
 
 import os, json, re, calendar
@@ -582,20 +582,32 @@ def route(question: str, company: Optional[Dict], db) -> Optional[Tuple]:
     if _month_pat and _year_pat:
         _m = month_names.get(_month_pat.group(1).lower())
         _y = int(_year_pat.group(1))
+        print(f"[Route] Month={_m} Year={_y} q='{q[:60]}'")
         if _m and _y:
             import calendar as _cal
             _start = datetime(_y, _m, 1)
             _end   = datetime(_y, _m, _cal.monthrange(_y, _m)[1], 23, 59, 59)
-            if has("list","show","give","all") and has("voucher","invoice","bill"):
+            print(f"[Route] Date range: {_start} to {_end}")
+            _has_list    = has("list","show","give","all")
+            _has_voucher = has("voucher","invoice","bill")
+            print(f"[Route] has_list={_has_list} has_voucher={_has_voucher}")
+            if _has_list and _has_voucher:
                 # List individual vouchers for this month
                 _vt = "purchase" if has("purchase") else "sales"
                 mf = qb._mf({"type":_vt,
                              "billFinalAmount":{"$gt":0},
                              "issueDate":{"$gte":_start,"$lte":_end}})
-                rows = find(db,"Voucher",mf,
-                    proj={"_id":0,"voucherNo":1,"issueDate":1,"billFinalAmount":1,
-                          "dueAmount":1,"status":1,"party.name":1},
-                    sort=[("issueDate",1)],limit=100)
+                try:
+                    rows = find(db,"Voucher",mf,
+                        proj={"_id":0,"voucherNo":1,"issueDate":1,"billFinalAmount":1,
+                              "dueAmount":1,"status":1,"party.name":1},
+                        sort=[("issueDate",1)],limit=100)
+                    print(f"[Route] list-voucher returned {len(rows)} rows")
+                    if rows:
+                        print(f"[Route] First row: {rows[0]}")
+                except Exception as _e:
+                    print(f"[Route] list-voucher ERROR: {_e}")
+                    rows = []
                 mon_label = _cal.month_name[_m]
                 return rows, {"type":"table","x_field":"voucherNo","y_field":"billFinalAmount",
                               "title":f"{n} — Vouchers {mon_label} {_y}"}
@@ -1121,7 +1133,7 @@ class MongoAIAgent:
         except: return False
 
     def query(self, question: str) -> Dict:
-        assert AGENT_VERSION == "4.21", f"Wrong agent version: {AGENT_VERSION}"
+        assert AGENT_VERSION == "4.22", f"Wrong agent version: {AGENT_VERSION}"
 
         if not self.llm and not self.init_llm():
             return {"error": "GROQ_API_KEY not configured."}
