@@ -9,7 +9,7 @@ Root causes fixed in v4.4:
   4. Item collection also uses $in filter
   5. resolve_company() now returns both obj_id and str_id always
 """
-AGENT_VERSION = "4.18"
+AGENT_VERSION = "4.20"
 print(f"[Agent] Loading agent.py version {AGENT_VERSION}")
 
 import os, json, re, calendar
@@ -313,7 +313,7 @@ class Q:
     # ── Voucher queries ───────────────────────────────────────────────────────
 
     def voucher_count(self, vtype=None, name="Company"):
-        mf = self._mf({"type": vtype} if vtype else {})
+        mf = self._mf({"type": vtype, "billFinalAmount":{"$gt":0}} if vtype else {"billFinalAmount":{"$gt":0}})
         rows = agg(self.db, "Voucher", [
             {"$match": mf},
             {"$group": {"_id":None,"total_vouchers":{"$sum":1},
@@ -345,7 +345,7 @@ class Q:
 
     def top_customers(self, limit=15, name="Company"):
         rows = agg(self.db, "Voucher", [
-            {"$match": self._mf({"type":"sales","party.name":{"$ne":None}})},
+            {"$match": self._mf({"type":"sales","party.name":{"$ne":None},"billFinalAmount":{"$gt":0}})},
             {"$group": {"_id":"$party.name","revenue":{"$sum":"$billFinalAmount"},"invoices":{"$sum":1}}},
             {"$sort":{"revenue":-1}},{"$limit":limit},
             {"$project":{"_id":0,"customer":"$_id","revenue":1,"invoices":1}}
@@ -372,7 +372,7 @@ class Q:
 
     def sales_vs_purchases(self, name="Company"):
         rows = agg(self.db,"Voucher",[
-            {"$match": self._mf({"type":{"$in":["sales","purchase"]}})},
+            {"$match": self._mf({"type":{"$in":["sales","purchase"]},"billFinalAmount":{"$gt":0}})},
             {"$group": {"_id":"$type","total":{"$sum":"$billFinalAmount"},"count":{"$sum":1}}},
             {"$project":{"_id":0,"type":"$_id","total":1,"count":1}}
         ])
@@ -400,7 +400,7 @@ class Q:
             _start = _dt.datetime(min(yrs), 1, 1)
             _end   = _dt.datetime(max(yrs)+1, 1, 1)
             rows = agg(self.db,"Voucher",[
-                {"$match": self._mf({"type":"sales",
+                {"$match": self._mf({"type":"sales","billFinalAmount":{"$gt":0},
                                      "issueDate":{"$gte":_start,"$lt":_end}})},
                 {"$group": {"_id":{"year":{"$year":"$issueDate"},
                                    "month":{"$month":"$issueDate"}},
@@ -428,7 +428,7 @@ class Q:
             # Company-specific: use Voucher.billFinalAmount — this is the
             # FINAL billed amount (includes taxes, charges) — most accurate
             # and consistent with what Invock ERP shows on reports
-            mf = self._mf({"type":"sales"})
+            mf = self._mf({"type":"sales","billFinalAmount":{"$gt":0}})
             rows = agg(self.db,"Voucher",[
                 {"$match": mf},
                 {"$group": {"_id":None,
@@ -586,7 +586,18 @@ def route(question: str, company: Optional[Dict], db) -> Optional[Tuple]:
             import calendar as _cal
             _start = datetime(_y, _m, 1)
             _end   = datetime(_y, _m, _cal.monthrange(_y, _m)[1], 23, 59, 59)
-            if has("sales","revenue","voucher","amount"):
+            if has("list","show","give","all") and has("voucher","invoice","bill"):
+                # List individual vouchers for this month
+                mf = qb._mf({"type":"sales" if not has("purchase") else "purchase",
+                             "issueDate":{"$gte":_start,"$lte":_end}})
+                rows = find(db,"Voucher",mf,
+                    proj={"_id":0,"voucherNo":1,"issueDate":1,"billFinalAmount":1,
+                          "status":1,"party.name":1},
+                    sort=[("issueDate",1)],limit=50)
+                mon_label = _cal.month_name[_m]
+                return rows, {"type":"table","x_field":"voucherNo","y_field":"billFinalAmount",
+                              "title":f"{n} — Vouchers {mon_label} {_y}"}
+            if has("sales","revenue","voucher","amount","total","how many","count"):
                 # Use Voucher with date range for accuracy
                 mf = qb._mf({"type":"sales",
                              "issueDate":{"$gte":_start,"$lte":_end}})
@@ -852,6 +863,30 @@ def schema_shortcut(q: str) -> Optional[Dict]:
             tmpl="Average order value.",ct="metric",y="avg_order_value",
             title="Average Order Value (All Companies)")
 
+    # ── List vouchers with date filter ────────────────────────────────────────
+    month_map = {"january":1,"february":2,"march":3,"april":4,"may":5,"june":6,
+                 "july":7,"august":8,"september":9,"october":10,"november":11,"december":12,
+                 "jan":1,"feb":2,"mar":3,"apr":4,"jun":6,"jul":7,"aug":8,
+                 "sep":9,"oct":10,"nov":11,"dec":12}
+    _mp = re.search(r"\b(january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|jun|jul|aug|sep|oct|nov|dec)\b", q)
+    _yp = re.search(r"\b(20\d{2})\b", q)
+    if re.search(r"list.*voucher|voucher.*list|show.*voucher|give.*voucher|all.*voucher|voucher.*in", q) and _mp and _yp:
+        import datetime as _dt, calendar as _cal
+        _m = month_map.get(_mp.group(1).lower())
+        _y = int(_yp.group(1))
+        if _m and _y:
+            _vtype = "purchase" if "purchase" in q else "sales"
+            _start = _dt.datetime(_y, _m, 1)
+            _end   = _dt.datetime(_y, _m, _cal.monthrange(_y, _m)[1], 23, 59, 59)
+            return plan("find","Voucher",
+                fq={"type":_vtype,"issueDate":{"$gte":_start,"$lte":_end}},
+                proj={"_id":0,"voucherNo":1,"issueDate":1,"billFinalAmount":1,
+                      "status":1,"party.name":1,"type":1},
+                sort={"issueDate":1},limit=50,
+                tmpl=f"Sales vouchers for {_cal.month_name[_m]} {_y}.",
+                ct="table",x="voucherNo",y="billFinalAmount",
+                title=f"Sales Vouchers — {_cal.month_name[_m]} {_y}")
+
     if re.search(r"how many (customer|supplier|client)", q) and miss("company","with","in"):
         rel   = "customer" if "customer" in q or "client" in q else "supplier"
         field = f"total_{rel}s"
@@ -871,9 +906,12 @@ DATABASE: dev-cluster — Invock ERP — Jewellery business, India, amounts in �
 FILTER FIELDS:
   type: string — EXACT values: "sales" | "purchase" | "receipt" | "payment"
   status: string — EXACT values: "unpaid" | "paid" | "partial"
-  iCompanyId: ObjectId (e.g. ObjectId("651ea989a7dc3e26bda36036")) — CONFIRMED ObjectId, NOT string
-    (db.Voucher.countDocuments({iCompanyId:"651ea..."}) returns 0
-     db.Voucher.countDocuments({iCompanyId:ObjectId("651ea...")}) returns 766)
+  iCompanyId: ObjectId (e.g. ObjectId("651ea989a7dc3e26bda36036")) — CONFIRMED ObjectId
+    Confirmed from real document: iCompanyId: ObjectId('651ea989a7dc3e26bda36036')
+  billFinalAmount: USE THIS for all revenue. Zero-amount docs are drafts/test vouchers.
+    Always add billFinalAmount:{$gt:0} to exclude drafts.
+  lineAmountSum: pre-discount item total (slightly less than billFinalAmount)
+    This matches ItemQuantityTracker.amount — do NOT use for final revenue
   issueDate: ISODate object (e.g. ISODate("2024-02-15T04:53:16.000Z"))
   isHidden: boolean — add {isHidden:false} or ignore hidden vouchers
   iBranchId: ObjectId
@@ -1079,7 +1117,7 @@ class MongoAIAgent:
         except: return False
 
     def query(self, question: str) -> Dict:
-        assert AGENT_VERSION == "4.18", f"Wrong agent version: {AGENT_VERSION}"
+        assert AGENT_VERSION == "4.20", f"Wrong agent version: {AGENT_VERSION}"
 
         if not self.llm and not self.init_llm():
             return {"error": "GROQ_API_KEY not configured."}
