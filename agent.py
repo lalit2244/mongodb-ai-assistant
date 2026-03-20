@@ -9,7 +9,7 @@ Root causes fixed in v4.4:
   4. Item collection also uses $in filter
   5. resolve_company() now returns both obj_id and str_id always
 """
-AGENT_VERSION = "4.13"
+AGENT_VERSION = "4.16"
 print(f"[Agent] Loading agent.py version {AGENT_VERSION}")
 
 import os, json, re, calendar
@@ -393,13 +393,32 @@ class Q:
     def monthly_trend(self, years=None, name="Company"):
         d   = get_dates()
         yrs = years or [d["ty"]-1, d["ty"]]
-        rows = agg(self.db,"ItemQuantityTracker",[
-            {"$match": self._mf({"voucherType":"sales","year":{"$in":yrs}})},
-            {"$group": {"_id":{"year":"$year","month":"$month"},
-                        "amount":{"$sum":"$amount"},"qty":{"$sum":"$qty"}}},
-            {"$sort":{"_id.year":1,"_id.month":1}},
-            {"$project":{"_id":0,"year":"$_id.year","month":"$_id.month","amount":1,"qty":1}}
-        ])
+        if self.company:
+            # Company-specific: use Voucher.issueDate for exact accuracy
+            # This matches MongoDB Compass results precisely
+            import datetime as _dt
+            _start = _dt.datetime(min(yrs), 1, 1)
+            _end   = _dt.datetime(max(yrs)+1, 1, 1)
+            rows = agg(self.db,"Voucher",[
+                {"$match": self._mf({"type":"sales",
+                                     "issueDate":{"$gte":_start,"$lt":_end}})},
+                {"$group": {"_id":{"year":{"$year":"$issueDate"},
+                                   "month":{"$month":"$issueDate"}},
+                            "amount":{"$sum":"$billFinalAmount"},
+                            "count":{"$sum":1}}},
+                {"$sort":{"_id.year":1,"_id.month":1}},
+                {"$project":{"_id":0,"year":"$_id.year","month":"$_id.month",
+                             "amount":1,"count":1}}
+            ])
+        else:
+            # Global: use IQT (faster for all-company aggregation)
+            rows = agg(self.db,"ItemQuantityTracker",[
+                {"$match": self._mf({"voucherType":"sales","year":{"$in":yrs}})},
+                {"$group": {"_id":{"year":"$year","month":"$month"},
+                            "amount":{"$sum":"$amount"},"qty":{"$sum":"$qty"}}},
+                {"$sort":{"_id.year":1,"_id.month":1}},
+                {"$project":{"_id":0,"year":"$_id.year","month":"$_id.month","amount":1,"qty":1}}
+            ])
         return rows, {"type":"line","x_field":"month","y_field":"amount",
                       "title":f"{name} — Monthly Sales Trend"}
 
@@ -531,6 +550,50 @@ def route(question: str, company: Optional[Dict], db) -> Optional[Tuple]:
     if re.search(r"how many voucher|voucher count|number of voucher|count.*voucher|total.*voucher", q):
         vtype = "sales" if "sales" in q else "purchase" if "purchase" in q else None
         return qb.voucher_count(vtype, n)
+
+    # ── Sales for specific month+year ────────────────────────────────────────
+    month_names = {"january":1,"february":2,"march":3,"april":4,"may":5,"june":6,
+                   "july":7,"august":8,"september":9,"october":10,"november":11,"december":12,
+                   "jan":1,"feb":2,"mar":3,"apr":4,"jun":6,"jul":7,"aug":8,
+                   "sep":9,"oct":10,"nov":11,"dec":12}
+    _month_pat = re.search(r"\b(january|february|march|april|may|june|july|august|"
+                            r"september|october|november|december|"
+                            r"jan|feb|mar|apr|jun|jul|aug|sep|oct|nov|dec)\b", q)
+    _year_pat  = re.search(r"\b(20\d{2})\b", q)
+    if _month_pat and _year_pat:
+        _m = month_names.get(_month_pat.group(1).lower())
+        _y = int(_year_pat.group(1))
+        if _m and _y:
+            import calendar as _cal
+            _start = datetime(_y, _m, 1)
+            _end   = datetime(_y, _m, _cal.monthrange(_y, _m)[1], 23, 59, 59)
+            if has("sales","revenue","voucher","amount"):
+                # Use Voucher with date range for accuracy
+                mf = qb._mf({"type":"sales",
+                             "issueDate":{"$gte":_start,"$lte":_end}})
+                rows = agg(db,"Voucher",[
+                    {"$match": mf},
+                    {"$group":{"_id":None,
+                               "total_revenue":{"$sum":"$billFinalAmount"},
+                               "total_vouchers":{"$sum":1}}},
+                    {"$project":{"_id":0,"total_revenue":1,"total_vouchers":1}}
+                ])
+                mon_label = _cal.month_name[_m]
+                return rows, {"type":"metric","x_field":None,"y_field":"total_revenue",
+                              "title":f"{n} — Sales {mon_label} {_y}"}
+            if has("purchase"):
+                mf = qb._mf({"type":"purchase",
+                             "issueDate":{"$gte":_start,"$lte":_end}})
+                rows = agg(db,"Voucher",[
+                    {"$match": mf},
+                    {"$group":{"_id":None,
+                               "total_purchases":{"$sum":"$billFinalAmount"},
+                               "total_vouchers":{"$sum":1}}},
+                    {"$project":{"_id":0,"total_purchases":1,"total_vouchers":1}}
+                ])
+                mon_label = _cal.month_name[_m]
+                return rows, {"type":"metric","x_field":None,"y_field":"total_purchases",
+                              "title":f"{n} — Purchases {mon_label} {_y}"}
 
     # ── Revenue / Sales total ─────────────────────────────────────────────────
     if re.search(r"total.*(revenue|sales|amount)|revenue.*total|(sales|revenue).*this year|ytd|year.*to.*date", q):
@@ -788,7 +851,9 @@ DATABASE: dev-cluster — Invock ERP — Jewellery business, India, amounts in �
 FILTER FIELDS:
   type: string — EXACT values: "sales" | "purchase" | "receipt" | "payment"
   status: string — EXACT values: "unpaid" | "paid" | "partial"
-  iCompanyId: string (e.g. "651ea989a7dc3e26bda36036") OR null — NOT ObjectId in this collection
+  iCompanyId: ObjectId (e.g. ObjectId("651ea989a7dc3e26bda36036")) — CONFIRMED ObjectId, NOT string
+    (db.Voucher.countDocuments({iCompanyId:"651ea..."}) returns 0
+     db.Voucher.countDocuments({iCompanyId:ObjectId("651ea...")}) returns 766)
   issueDate: ISODate object (e.g. ISODate("2024-02-15T04:53:16.000Z"))
   isHidden: boolean — add {isHidden:false} or ignore hidden vouchers
   iBranchId: ObjectId
@@ -814,7 +879,7 @@ DO NOT PROJECT: itemList, transactions, tax, voucherList, otherCharges, expenseL
   (these are large arrays that slow queries and inflate responses)
 
 SAMPLE DOCUMENT:
-  {type:"sales", billFinalAmount:11124, status:"unpaid", iCompanyId:"651ea...",
+  {type:"sales", billFinalAmount:11124, status:"unpaid", iCompanyId:ObjectId("651ea..."),
    issueDate:ISODate("2024-02-15"), party:{name:" AASIF ", state:"Kerala"},
    voucherNo:"SA/2324/PL/1", lineItemQtySum:20}
 
@@ -875,7 +940,7 @@ OTHER FIELDS:
   No iCompanyId field — _id IS the identifier
 
 === KEY RULES FOR QUERY GENERATION ===
-1. Voucher.iCompanyId is a STRING — filter with string, not ObjectId
+1. Voucher.iCompanyId is ObjectId — CONFIRMED from real data (string returns 0 docs)
 2. ItemQuantityTracker.iCompanyId is ObjectId — filter with ObjectId
 3. Item.iCompanyId is ObjectId — filter with ObjectId
 4. ALWAYS use billFinalAmount for revenue from Voucher (not lineAmountSum)
@@ -994,7 +1059,7 @@ class MongoAIAgent:
         except: return False
 
     def query(self, question: str) -> Dict:
-        assert AGENT_VERSION == "4.13", f"Wrong agent version: {AGENT_VERSION}"
+        assert AGENT_VERSION == "4.16", f"Wrong agent version: {AGENT_VERSION}"
 
         if not self.llm and not self.init_llm():
             return {"error": "GROQ_API_KEY not configured."}
