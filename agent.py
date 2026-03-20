@@ -9,7 +9,7 @@ Root causes fixed in v4.4:
   4. Item collection also uses $in filter
   5. resolve_company() now returns both obj_id and str_id always
 """
-AGENT_VERSION = "4.11"
+AGENT_VERSION = "4.13"
 print(f"[Agent] Loading agent.py version {AGENT_VERSION}")
 
 import os, json, re, calendar
@@ -782,13 +782,109 @@ def schema_shortcut(q: str) -> Optional[Dict]:
 # ═══════════════════════════ LLM Fallback ════════════════════════════════════
 
 SCHEMA_TEXT = """
-DATABASE: dev-cluster — Invock ERP (Jewellery, India, ₹ INR)
-Voucher(1.3M): type,billFinalAmount,dueAmount,paidAmount,status,iCompanyId,issueDate(Date),party.name,voucherNo
-ItemQuantityTracker(2.1M): voucherType,month(int),year(int),itemId,qty,amount,iCompanyId
-Item(450K): name,skuBarcode,availableQty,unit,iCompanyId,isHidden
-Business(45K): name,relationType,city,state,iCompanyId
-IBranch(264),IUser(399),ICompany(135): name,industry/financialYear
-Account(51K): name,accountGroupName,balance,iCompanyId
+DATABASE: dev-cluster — Invock ERP — Jewellery business, India, amounts in ₹ INR (rupees, NOT paise)
+
+=== VOUCHER collection (1.3M documents) ===
+FILTER FIELDS:
+  type: string — EXACT values: "sales" | "purchase" | "receipt" | "payment"
+  status: string — EXACT values: "unpaid" | "paid" | "partial"
+  iCompanyId: string (e.g. "651ea989a7dc3e26bda36036") OR null — NOT ObjectId in this collection
+  issueDate: ISODate object (e.g. ISODate("2024-02-15T04:53:16.000Z"))
+  isHidden: boolean — add {isHidden:false} or ignore hidden vouchers
+  iBranchId: ObjectId
+
+AMOUNT FIELDS (all in ₹ rupees):
+  billFinalAmount: final invoice amount INCLUDING tax — USE THIS for revenue totals
+  billItemsPrice: pre-discount item total
+  billAmountBeforeTax: amount before tax
+  billTaxAmount: tax amount only
+  dueAmount: amount still unpaid
+  paidAmount: amount already paid
+  lineAmountSum: sum of line items (pre-tax)
+  lineItemQtySum: total quantity across all items
+
+OTHER FIELDS:
+  voucherNo: string (e.g. "SA/2324/PL/1")
+  party.name: string — customer/supplier name (may have spaces e.g. " AASIF ")
+  party.state: string — customer state
+  party.city: string — customer city
+  narration: string — notes
+
+DO NOT PROJECT: itemList, transactions, tax, voucherList, otherCharges, expenseList
+  (these are large arrays that slow queries and inflate responses)
+
+SAMPLE DOCUMENT:
+  {type:"sales", billFinalAmount:11124, status:"unpaid", iCompanyId:"651ea...",
+   issueDate:ISODate("2024-02-15"), party:{name:" AASIF ", state:"Kerala"},
+   voucherNo:"SA/2324/PL/1", lineItemQtySum:20}
+
+=== ITEMQUANTITYTRACKER collection (2.1M documents) ===
+FILTER FIELDS:
+  voucherType: string — "sales" | "purchase"
+  year: integer (e.g. 2024, 2025) — ALWAYS filter by year, never sum all years
+  month: integer 1-12
+  iCompanyId: ObjectId (e.g. ObjectId("63a3eac5b03f790f14f2b201")) — ObjectId NOT string
+  itemId: ObjectId
+  iBranchId: ObjectId
+
+AMOUNT FIELDS:
+  amount: number in ₹ rupees — item-level sales amount
+  qty: number — quantity sold/purchased
+
+NOTE: amount here is item-level only, slightly lower than Voucher.billFinalAmount
+  because it excludes service charges and freight added at invoice level.
+
+SAMPLE DOCUMENTS (both confirmed from real data):
+  Sales:   {month:10, year:2020, voucherType:"sales",    iCompanyId:ObjectId("5d92..."), qty:1512, amount:12105.78}
+  Purchase:{month:8,  year:2024, voucherType:"purchase", iCompanyId:ObjectId("63a3..."), qty:4,    amount:2400}
+
+NOTE: IQT has data from 2020 onwards. trippingValue format is YYYYFYYY (financial year) — do not use for filtering.
+startDate/endDate fields exist but year+month integers are faster and more reliable for filtering.
+
+=== ITEM collection (450K documents) ===
+FILTER FIELDS:
+  iCompanyId: ObjectId — ObjectId NOT string
+  isHidden: boolean — ALWAYS add {isHidden:false} to exclude deleted items
+  availableQty: number (can be negative if oversold)
+
+OTHER FIELDS:
+  name: string — item name
+  skuBarcode: string — SKU code
+  unit: string (e.g. "pcs", "pair", "gm")
+  unitSellRetailPrice: number in ₹
+  unitSellWholeSalePrice: number in ₹
+  unitPurchasePrice: number in ₹
+
+=== BUSINESS collection (45K documents) ===
+FILTER FIELDS:
+  relationType: string — "customer" | "supplier" | "both"
+  iCompanyId: ObjectId OR null (mixed — some records have null)
+  isHidden: boolean
+
+OTHER FIELDS:
+  name: string — business/party name
+  city, state: strings
+  gstin: string — GST number
+  code: string — business code
+
+=== ICOMPANY collection (141 documents) ===
+  _id: ObjectId — this IS the company ID used in other collections
+  name: string — company name
+  industry: string (e.g. "imitation-jewellery", "computers")
+  currencyUnit: "INR"
+  No iCompanyId field — _id IS the identifier
+
+=== KEY RULES FOR QUERY GENERATION ===
+1. Voucher.iCompanyId is a STRING — filter with string, not ObjectId
+2. ItemQuantityTracker.iCompanyId is ObjectId — filter with ObjectId
+3. Item.iCompanyId is ObjectId — filter with ObjectId
+4. ALWAYS use billFinalAmount for revenue from Voucher (not lineAmountSum)
+5. ALWAYS filter by year in ItemQuantityTracker — never aggregate all years
+6. NEVER project itemList, transactions, tax, voucherList arrays
+7. party.name may have leading/trailing spaces — use $regex or $ne:null not exact match
+8. Amounts are in RUPEES — do not divide by 100
+9. issueDate is ISODate object — use $gte/$lte with ISODate for date ranges
+10. For monthly data: use ItemQuantityTracker with year+month integer filters
 """
 
 def llm_prompt(dates):
@@ -808,7 +904,10 @@ def llm_prompt(dates):
 }}
 TODAY: {d['now'].strftime('%Y-%m-%d')}  TY={d['ty']}  LM={d['lm_num']}/{d['lm_year']}
 RULES:
-1. iCompanyId format unknown — agent handles filtering, do not add iCompanyId to pipelines
+1. iCompanyId format DIFFERS by collection:
+   Voucher: STRING (e.g. "651ea989a7dc3e26bda36036") — agent injects this
+   IQT/Item: ObjectId — agent injects this
+   Never add iCompanyId yourself — agent always handles it
 2. $sum/$avg must be {{"$sum":"$fieldName"}} (with $ prefix)
 3. Every agg must end with $project removing _id
 4. issueDate is Date object — use ISO strings, agent converts
@@ -895,7 +994,7 @@ class MongoAIAgent:
         except: return False
 
     def query(self, question: str) -> Dict:
-        assert AGENT_VERSION == "4.11", f"Wrong agent version: {AGENT_VERSION}"
+        assert AGENT_VERSION == "4.13", f"Wrong agent version: {AGENT_VERSION}"
 
         if not self.llm and not self.init_llm():
             return {"error": "GROQ_API_KEY not configured."}
