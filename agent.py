@@ -9,7 +9,7 @@ Root causes fixed in v4.4:
   4. Item collection also uses $in filter
   5. resolve_company() now returns both obj_id and str_id always
 """
-AGENT_VERSION = "4.17"
+AGENT_VERSION = "4.18"
 print(f"[Agent] Loading agent.py version {AGENT_VERSION}")
 
 import os, json, re, calendar
@@ -771,7 +771,8 @@ def schema_shortcut(q: str) -> Optional[Dict]:
             proj={"_id":0,"name":1,"industry":1,"financialYear":1},
             limit=200,tmpl="All companies.",ct="table",title="All Companies")
 
-    if re.search(r"how many compan", q) and miss("with","in","for","sales","voucher","most","top","rank"):
+    if re.search(r"how many compan|no of compan|number of compan|count.*compan|compan.*count|"
+                  r"show.*compan|total.*compan|list.*how many|compan.*total", q) and        miss("with","in","for","sales","voucher","most","top","rank","customer","supplier"):
         return plan("aggregate","ICompany",
             pipe=[{"$count":"total_companies"}],
             tmpl="Total companies.",ct="metric",y="total_companies",
@@ -1078,7 +1079,7 @@ class MongoAIAgent:
         except: return False
 
     def query(self, question: str) -> Dict:
-        assert AGENT_VERSION == "4.17", f"Wrong agent version: {AGENT_VERSION}"
+        assert AGENT_VERSION == "4.18", f"Wrong agent version: {AGENT_VERSION}"
 
         if not self.llm and not self.init_llm():
             return {"error": "GROQ_API_KEY not configured."}
@@ -1383,6 +1384,20 @@ class MongoAIAgent:
 
         if len(results) == 1:
             row   = fmt_row(results[0])
+            # Special case: single metric with clean natural language
+            if len(row) == 1:
+                k, v = list(row.items())[0]
+                co_label = f" for **{company['name']}**" if company else ""
+                # Map field names to natural sentences
+                if "total_companies" in k:
+                    return f"There are **{v}** companies in the system."
+                if "total_customers" in k:
+                    return f"**{company['name'] if company else 'All companies'}** has **{v}** unique customers."
+                if "total_suppliers" in k:
+                    return f"**{company['name'] if company else 'All companies'}** has **{v}** suppliers."
+                if "total_vouchers" in k:
+                    return f"Total vouchers{co_label}: **{v}**"
+                return f"**{k.replace('_',' ').title()}**{co_label}: **{v}**"
             parts = [f"**{k}**: {v}" for k, v in row.items()]
             if parts:
                 co_label = f" for **{company['name']}**" if company else ""
