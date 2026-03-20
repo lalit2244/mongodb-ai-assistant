@@ -9,7 +9,7 @@ Root causes fixed in v4.4:
   4. Item collection also uses $in filter
   5. resolve_company() now returns both obj_id and str_id always
 """
-AGENT_VERSION = "4.16"
+AGENT_VERSION = "4.17"
 print(f"[Agent] Loading agent.py version {AGENT_VERSION}")
 
 import os, json, re, calendar
@@ -555,11 +555,30 @@ def route(question: str, company: Optional[Dict], db) -> Optional[Tuple]:
     month_names = {"january":1,"february":2,"march":3,"april":4,"may":5,"june":6,
                    "july":7,"august":8,"september":9,"october":10,"november":11,"december":12,
                    "jan":1,"feb":2,"mar":3,"apr":4,"jun":6,"jul":7,"aug":8,
-                   "sep":9,"oct":10,"nov":11,"dec":12}
-    _month_pat = re.search(r"\b(january|february|march|april|may|june|july|august|"
-                            r"september|october|november|december|"
-                            r"jan|feb|mar|apr|jun|jul|aug|sep|oct|nov|dec)\b", q)
+                   "sep":9,"oct":10,"nov":11,"dec":12,
+                   # common typos / alternate spellings
+                   "januray":1,"januaray":1,"janaury":1,
+                   "februray":2,"februvary":2,"februrary":2,"febuary":2,"feburary":2,
+                   "marchh":3,"aprrl":4,"appril":4,
+                   "septembar":9,"setember":9,"septmber":9,
+                   "octomber":10,"octobar":10,"novembar":11,"decembar":12}
+    # Build regex from all known month keys
+    _all_months = "|".join(sorted(month_names.keys(), key=len, reverse=True))
+    _month_pat = re.search(rf"\b({_all_months})\b", q)
     _year_pat  = re.search(r"\b(20\d{2})\b", q)
+    # Fallback: if no month matched, try fuzzy match for common typos
+    if not _month_pat and _year_pat:
+        import difflib as _dl
+        _words = q.split()
+        _all_month_names = list(month_names.keys())
+        for _w in _words:
+            if len(_w) >= 3:
+                _close = _dl.get_close_matches(_w, _all_month_names, n=1, cutoff=0.75)
+                if _close:
+                    class _FakeMatch:
+                        def group(self, n): return _close[0]
+                    _month_pat = _FakeMatch()
+                    break
     if _month_pat and _year_pat:
         _m = month_names.get(_month_pat.group(1).lower())
         _y = int(_year_pat.group(1))
@@ -1059,7 +1078,7 @@ class MongoAIAgent:
         except: return False
 
     def query(self, question: str) -> Dict:
-        assert AGENT_VERSION == "4.16", f"Wrong agent version: {AGENT_VERSION}"
+        assert AGENT_VERSION == "4.17", f"Wrong agent version: {AGENT_VERSION}"
 
         if not self.llm and not self.init_llm():
             return {"error": "GROQ_API_KEY not configured."}
