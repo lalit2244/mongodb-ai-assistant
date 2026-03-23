@@ -9,7 +9,7 @@ Root causes fixed in v4.4:
   4. Item collection also uses $in filter
   5. resolve_company() now returns both obj_id and str_id always
 """
-AGENT_VERSION = "4.22"
+AGENT_VERSION = "4.25"
 print(f"[Agent] Loading agent.py version {AGENT_VERSION}")
 
 import os, json, re, calendar
@@ -247,12 +247,17 @@ def extract_company_name(question: str) -> Optional[str]:
     if re.search(r'\b[0-9a-fA-F]{24}\b', question):
         return None
     patterns = [
+        # Pattern 0: "for COMPANY" at very end of string — MUST be first to avoid
+        # greedy patterns capturing date+company together
+        r"(?:in|of|for)\s+([A-Za-z][A-Za-z /\-&.']{2,50}?)\s*$",
+        # Pattern 1: explicit "company X" keyword
         r"company\s+(?:with|named?|called?|of|id|having|like)?\s*['\"]?([A-Za-z0-9][A-Za-z0-9 /\-&.']{2,50}?)['\"]?\s*(?:\?|$|\.|,)",
         r"(?:in|for|of|from)\s+(?:the\s+)?company\s+['\"]?([A-Za-z0-9][A-Za-z0-9 /\-&.']{2,50}?)['\"]?\s*(?:\?|$|\.|,)",
         r"(?:in|with|for|from)\s+['\"]?([A-Za-z0-9][A-Za-z0-9 /\-&.']{2,50}?)['\"]?\s+company\b",
-        r"(?:vouchers?|sales?|purchases?|records?|revenue|invoices?)\s+(?:in|of|for|from)\s+['\"]?([A-Za-z0-9][A-Za-z0-9 /\-&.']{2,40}?)['\"]?\s*(?:\?|$|\.|,)",
+        # Pattern 4: vouchers/sales FOR company — restrict to letters only (no digits)
+        # to avoid capturing "april 2025 for CJ Enterprises" as company name
+        r"(?:vouchers?|sales?|purchases?|records?|revenue|invoices?)\s+(?:of|from)\s+['\"]?([A-Za-z][A-Za-z /\-&.']{2,40}?)['\"]?\s*(?:\?|$|\.|,)",
         r"([A-Za-z0-9][A-Za-z0-9 /\-&.']{2,40}?)(?:'s)\s+(?:vouchers?|sales?|data|revenue|customers?)",
-        r"(?:of|for)\s+([A-Za-z0-9][A-Za-z0-9 /\-&.']{2,50}?)\s*$",
         r"does\s+([A-Za-z0-9][A-Za-z0-9 /\-&.']{2,50}?)\s+have",
         r"(?:customers?|suppliers?|vouchers?|sales?|stock|revenue|trend|products?)\s+(?:does|of|for)\s+([A-Za-z0-9][A-Za-z0-9 /\-&.']{2,50}?)(?:\s*\?|$)",
         r"([A-Za-z0-9][A-Za-z0-9 /\-&.']{2,50}?)\s+(?:has|have|had)\s+(?:how many|\d)",
@@ -525,6 +530,7 @@ def route(question: str, company: Optional[Dict], db) -> Optional[Tuple]:
     d    = get_dates()
     has  = lambda *ws: any(w in q for w in ws)
     miss = lambda *ws: not any(w in q for w in ws)
+    print(f"[Route] CALLED: company={n!r} q='{q[:70]}'")
 
     # ── Company ranking ───────────────────────────────────────────────────────
     if re.search(r"(companies|company).*(most|top|highest|ranked?|maximum|max|list).*(voucher|sales|invoice)|"
@@ -1133,7 +1139,7 @@ class MongoAIAgent:
         except: return False
 
     def query(self, question: str) -> Dict:
-        assert AGENT_VERSION == "4.22", f"Wrong agent version: {AGENT_VERSION}"
+        assert AGENT_VERSION == "4.25", f"Wrong agent version: {AGENT_VERSION}"
 
         if not self.llm and not self.init_llm():
             return {"error": "GROQ_API_KEY not configured."}
@@ -1186,8 +1192,10 @@ class MongoAIAgent:
         # 2b: Fuzzy company name extraction from question
         if company is None:
             cname = extract_company_name(question)
+            print(f"[Query] extract_company_name='{cname}'")
             if cname and self.client:
                 company = resolve_company(self.client, cname)
+                print(f"[Query] resolve_company result: {company['name'] if company else 'NOT FOUND'}")
                 # NOTE: removed fallback resolve_company(client, full_question)
                 # that was accidentally matching generic words as company names
                 if company is None:
@@ -1321,12 +1329,18 @@ class MongoAIAgent:
                 pass
 
         col_explicit = None
-        for kw, cn in [("icompany","ICompany"),("ibranch","IBranch"),("iuser","IUser"),
-                        ("voucher","Voucher"),("item quantitytracker","ItemQuantityTracker"),
-                        ("itemquantitytracker","ItemQuantityTracker"),
-                        ("item","Item"),("business","Business"),
-                        ("account","Account"),("contact","Contact")]:
-            if kw in q.lower(): col_explicit = cn; break
+        # Only match collection keywords when NOT an analytics question
+        # "list of sales vouchers in april 2025" is analytics, not a collection dump
+        # "list all ICompany" IS a collection dump
+        if not _ANALYTICS_KW.search(question):
+            for kw, cn in [("icompany","ICompany"),("ibranch","IBranch"),("iuser","IUser"),
+                            ("item quantitytracker","ItemQuantityTracker"),
+                            ("itemquantitytracker","ItemQuantityTracker"),
+                            ("business","Business"),
+                            ("account","Account"),("contact","Contact")]:
+                if kw in q.lower(): col_explicit = cn; break
+        # Voucher/Item are NEVER used as collection dumps — always analytics
+        # They get handled by route() instead
 
         if col_explicit and re.search(r"(find|search|get|show|list|fetch|what|which|name|all)", q.lower()):
             proj = None; fq = {}
