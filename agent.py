@@ -8,12 +8,8 @@ Root causes fixed in v4.4:
   3. Business collection also uses $in filter
   4. Item collection also uses $in filter
   5. resolve_company() now returns both obj_id and str_id always
-
-Fix in v4.26:
-  6. route() now handles "from MONTH YEAR to MONTH YEAR" date ranges correctly
-     Previously only the first month was captured; now the full span is used.
 """
-AGENT_VERSION = "4.26"
+AGENT_VERSION = "4.25"
 print(f"[Agent] Loading agent.py version {AGENT_VERSION}")
 
 import os, json, re, calendar
@@ -262,6 +258,8 @@ def extract_company_name(question: str) -> Optional[str]:
         # to avoid capturing "april 2025 for CJ Enterprises" as company name
         r"(?:vouchers?|sales?|purchases?|records?|revenue|invoices?)\s+(?:of|from)\s+['\"]?([A-Za-z][A-Za-z /\-&.']{2,40}?)['\"]?\s*(?:\?|$|\.|,)",
         r"([A-Za-z0-9][A-Za-z0-9 /\-&.']{2,40}?)(?:'s)\s+(?:vouchers?|sales?|data|revenue|customers?)",
+        # Pattern: "for X vouchers/from" — catches "for CJ Enterprises vouchers from..."
+        r"(?:for|of)\s+([A-Za-z][A-Za-z0-9 /\-&.']{2,50}?)\s+(?:vouchers?\b|from\b)",
         r"does\s+([A-Za-z0-9][A-Za-z0-9 /\-&.']{2,50}?)\s+have",
         r"(?:customers?|suppliers?|vouchers?|sales?|stock|revenue|trend|products?)\s+(?:does|of|for)\s+([A-Za-z0-9][A-Za-z0-9 /\-&.']{2,50}?)(?:\s*\?|$)",
         r"([A-Za-z0-9][A-Za-z0-9 /\-&.']{2,50}?)\s+(?:has|have|had)\s+(?:how many|\d)",
@@ -274,7 +272,8 @@ def extract_company_name(question: str) -> Optional[str]:
     generic   = {"sales","purchase","voucher","revenue","data","record","item","companies",
                  "trend","customer","invoice","monthly","total","how","many","what","most",
                  "collection","icompany","ibranch","search","find","created","highest","top",
-                 "list","show","all","ranked","best","number","count","maximum"}
+                 "list","show","all","ranked","best","number","count","maximum",
+                 "fill","final","amount","bill","of"}
     for pat in patterns:
         m = re.search(pat, q, re.IGNORECASE)
         if m:
@@ -561,7 +560,7 @@ def route(question: str, company: Optional[Dict], db) -> Optional[Tuple]:
         vtype = "sales" if "sales" in q else "purchase" if "purchase" in q else None
         return qb.voucher_count(vtype, n)
 
-    # ── Month name lookup table (shared by both range and single-month blocks) ─
+    # ── Sales for specific month+year ────────────────────────────────────────
     month_names = {"january":1,"february":2,"march":3,"april":4,"may":5,"june":6,
                    "july":7,"august":8,"september":9,"october":10,"november":11,"december":12,
                    "jan":1,"feb":2,"mar":3,"apr":4,"jun":6,"jul":7,"aug":8,
@@ -572,72 +571,8 @@ def route(question: str, company: Optional[Dict], db) -> Optional[Tuple]:
                    "marchh":3,"aprrl":4,"appril":4,
                    "septembar":9,"setember":9,"septmber":9,
                    "octomber":10,"octobar":10,"novembar":11,"decembar":12}
-    # Build regex from all known month keys (longest first to avoid prefix collisions)
+    # Build regex from all known month keys
     _all_months = "|".join(sorted(month_names.keys(), key=len, reverse=True))
-
-    # ── DATE RANGE: "from MONTH YEAR to MONTH YEAR" ───────────────────────────
-    # FIX v4.26: Handle queries spanning two months/years such as
-    # "list vouchers for CJ Enterprises from april 2025 to may 2025".
-    # The old single-month block only captured the FIRST month (april),
-    # producing a date range of Apr 1–Apr 30 and missing all May vouchers.
-    # This block fires first whenever TWO month+year pairs are present.
-    _range_pat = re.search(
-        rf"(?:from\s+)?({_all_months})\s+(20\d{{2}})\s+to\s+({_all_months})\s+(20\d{{2}})",
-        q, re.IGNORECASE
-    )
-    if _range_pat:
-        _m1 = month_names.get(_range_pat.group(1).lower())
-        _y1 = int(_range_pat.group(2))
-        _m2 = month_names.get(_range_pat.group(3).lower())
-        _y2 = int(_range_pat.group(4))
-        print(f"[Route] DateRange detected: {_range_pat.group(1)} {_y1} → {_range_pat.group(3)} {_y2}")
-        if _m1 and _m2:
-            import calendar as _cal
-            _start = datetime(_y1, _m1, 1)
-            _end   = datetime(_y2, _m2, _cal.monthrange(_y2, _m2)[1], 23, 59, 59)
-            print(f"[Route] DateRange span: {_start} → {_end}")
-            _vt          = "purchase" if has("purchase") else "sales"
-            _has_list    = has("list", "show", "give", "all")
-            _has_voucher = has("voucher", "invoice", "bill")
-            _label1      = _cal.month_name[_m1]
-            _label2      = _cal.month_name[_m2]
-
-            if _has_list and _has_voucher:
-                # Return individual voucher rows for the full date span
-                mf = qb._mf({"type": _vt,
-                             "billFinalAmount": {"$gt": 0},
-                             "issueDate": {"$gte": _start, "$lte": _end}})
-                try:
-                    rows = find(db, "Voucher", mf,
-                        proj={"_id": 0, "voucherNo": 1, "issueDate": 1,
-                              "billFinalAmount": 1, "dueAmount": 1,
-                              "status": 1, "party.name": 1},
-                        sort=[("issueDate", 1)], limit=200)
-                    print(f"[Route] date-range list returned {len(rows)} rows")
-                except Exception as _e:
-                    print(f"[Route] date-range list ERROR: {_e}")
-                    rows = []
-                return rows, {"type": "table", "x_field": "voucherNo",
-                              "y_field": "billFinalAmount",
-                              "title": f"{n} — {_vt.title()} Vouchers {_label1} {_y1} – {_label2} {_y2}"}
-
-            # Aggregate revenue / purchases for the full date span
-            mf = qb._mf({"type": _vt,
-                         "issueDate": {"$gte": _start, "$lte": _end}})
-            _sum_field = "total_revenue" if _vt == "sales" else "total_purchases"
-            rows = agg(db, "Voucher", [
-                {"$match": mf},
-                {"$group": {"_id": None,
-                            _sum_field:      {"$sum": "$billFinalAmount"},
-                            "total_vouchers": {"$sum": 1}}},
-                {"$project": {"_id": 0, _sum_field: 1, "total_vouchers": 1}}
-            ])
-            return rows, {"type": "metric", "x_field": None,
-                          "y_field": _sum_field,
-                          "title": f"{n} — {_vt.title()} {_label1} {_y1} – {_label2} {_y2}"}
-    # ── END DATE RANGE FIX ────────────────────────────────────────────────────
-
-    # ── Sales for specific single month+year ──────────────────────────────────
     _month_pat = re.search(rf"\b({_all_months})\b", q)
     _year_pat  = re.search(r"\b(20\d{2})\b", q)
     # Fallback: if no month matched, try fuzzy match for common typos
@@ -1207,7 +1142,7 @@ class MongoAIAgent:
         except: return False
 
     def query(self, question: str) -> Dict:
-        assert AGENT_VERSION == "4.26", f"Wrong agent version: {AGENT_VERSION}"
+        assert AGENT_VERSION == "4.25", f"Wrong agent version: {AGENT_VERSION}"
 
         if not self.llm and not self.init_llm():
             return {"error": "GROQ_API_KEY not configured."}
