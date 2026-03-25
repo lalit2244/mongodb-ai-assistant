@@ -560,7 +560,7 @@ def route(question: str, company: Optional[Dict], db) -> Optional[Tuple]:
         vtype = "sales" if "sales" in q else "purchase" if "purchase" in q else None
         return qb.voucher_count(vtype, n)
 
-    # ── Sales for specific month+year ────────────────────────────────────────
+    # ── Month name lookup table (shared by both range and single-month blocks) ─
     month_names = {"january":1,"february":2,"march":3,"april":4,"may":5,"june":6,
                    "july":7,"august":8,"september":9,"october":10,"november":11,"december":12,
                    "jan":1,"feb":2,"mar":3,"apr":4,"jun":6,"jul":7,"aug":8,
@@ -571,8 +571,59 @@ def route(question: str, company: Optional[Dict], db) -> Optional[Tuple]:
                    "marchh":3,"aprrl":4,"appril":4,
                    "septembar":9,"setember":9,"septmber":9,
                    "octomber":10,"octobar":10,"novembar":11,"decembar":12}
-    # Build regex from all known month keys
     _all_months = "|".join(sorted(month_names.keys(), key=len, reverse=True))
+
+    # ── DATE RANGE: "from MONTH YEAR to MONTH YEAR" ───────────────────────────
+    _range_pat = re.search(
+        rf"(?:from\s+)?({_all_months})\s+(20\d{{2}})\s+to\s+({_all_months})\s+(20\d{{2}})",
+        q, re.IGNORECASE
+    )
+    if _range_pat:
+        _m1 = month_names.get(_range_pat.group(1).lower())
+        _y1 = int(_range_pat.group(2))
+        _m2 = month_names.get(_range_pat.group(3).lower())
+        _y2 = int(_range_pat.group(4))
+        print(f"[Route] DateRange: {_range_pat.group(1)} {_y1} to {_range_pat.group(3)} {_y2}")
+        if _m1 and _m2:
+            import calendar as _cal
+            _start = datetime(_y1, _m1, 1)
+            _end   = datetime(_y2, _m2, _cal.monthrange(_y2, _m2)[1], 23, 59, 59)
+            _vt          = "purchase" if has("purchase") else "sales"
+            _has_list    = has("list", "show", "give", "all")
+            _has_voucher = has("voucher", "invoice", "bill")
+            _label1      = _cal.month_name[_m1]
+            _label2      = _cal.month_name[_m2]
+
+            if _has_list and _has_voucher:
+                mf = qb._mf({"type": _vt, "billFinalAmount": {"$gt": 0},
+                             "issueDate": {"$gte": _start, "$lte": _end}})
+                try:
+                    rows = find(db, "Voucher", mf,
+                        proj={"_id":0,"voucherNo":1,"issueDate":1,"billFinalAmount":1,
+                              "dueAmount":1,"status":1,"party.name":1},
+                        sort=[("issueDate",1)], limit=200)
+                    print(f"[Route] date-range list: {len(rows)} rows")
+                except Exception as _e:
+                    print(f"[Route] date-range list ERROR: {_e}")
+                    rows = []
+                return rows, {"type":"table","x_field":"voucherNo","y_field":"billFinalAmount",
+                              "title":f"{n} — {_vt.title()} Vouchers {_label1} {_y1}–{_label2} {_y2}"}
+
+            # Aggregate total for the date range
+            _sum_field = "total_revenue" if _vt == "sales" else "total_purchases"
+            mf = qb._mf({"type": _vt, "billFinalAmount": {"$gt": 0},
+                         "issueDate": {"$gte": _start, "$lte": _end}})
+            rows = agg(db, "Voucher", [
+                {"$match": mf},
+                {"$group": {"_id":None,
+                            _sum_field:       {"$sum": "$billFinalAmount"},
+                            "total_vouchers": {"$sum": 1}}},
+                {"$project": {"_id":0, _sum_field:1, "total_vouchers":1}}
+            ])
+            return rows, {"type":"metric","x_field":None,"y_field":_sum_field,
+                          "title":f"{n} — {_vt.title()} {_label1} {_y1}–{_label2} {_y2}"}
+
+    # ── Sales for specific single month+year ──────────────────────────────────
     _month_pat = re.search(rf"\b({_all_months})\b", q)
     _year_pat  = re.search(r"\b(20\d{2})\b", q)
     # Fallback: if no month matched, try fuzzy match for common typos
