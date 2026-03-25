@@ -9,7 +9,7 @@ Root causes fixed in v4.4:
   4. Item collection also uses $in filter
   5. resolve_company() now returns both obj_id and str_id always
 """
-AGENT_VERSION = "4.28"
+AGENT_VERSION = "4.29"
 print(f"[Agent] Loading agent.py version {AGENT_VERSION}")
 
 import os, json, re, calendar
@@ -551,12 +551,12 @@ def route(question: str, company: Optional[Dict], db) -> Optional[Tuple]:
 
     # ── Voucher counts ────────────────────────────────────────────────────────
     if re.search(r"how many.*(sales|purchase|receipt|payment).*(voucher|invoice|bill|record)|"
-                 r"(voucher|invoice|bill).*(count|how many|total number|number of)", q):
+                 r"(voucher|invoice|bill).*(count|how many|total number|number of)", q) and miss("from","to","between","range"):
         vtype = ("sales" if "sales" in q else "purchase" if "purchase" in q else
                  "receipt" if "receipt" in q else "payment" if "payment" in q else None)
         return qb.voucher_count(vtype, n)
 
-    if re.search(r"how many voucher|voucher count|number of voucher|count.*voucher|total.*voucher", q):
+    if re.search(r"how many voucher|voucher count|number of voucher|count.*voucher|total.*voucher", q) and miss("from","to","between","range"):
         vtype = "sales" if "sales" in q else "purchase" if "purchase" in q else None
         return qb.voucher_count(vtype, n)
 
@@ -1193,7 +1193,7 @@ class MongoAIAgent:
         except: return False
 
     def query(self, question: str) -> Dict:
-        assert AGENT_VERSION == "4.28", f"Wrong agent version: {AGENT_VERSION}"
+        assert AGENT_VERSION == "4.29", f"Wrong agent version: {AGENT_VERSION}"
 
         if not self.llm and not self.init_llm():
             return {"error": "GROQ_API_KEY not configured."}
