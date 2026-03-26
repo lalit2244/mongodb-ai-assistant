@@ -9,7 +9,7 @@ Root causes fixed in v4.4:
   4. Item collection also uses $in filter
   5. resolve_company() now returns both obj_id and str_id always
 """
-AGENT_VERSION = "4.29"
+AGENT_VERSION = "4.30"
 print(f"[Agent] Loading agent.py version {AGENT_VERSION}")
 
 import os, json, re, calendar
@@ -573,17 +573,27 @@ def route(question: str, company: Optional[Dict], db) -> Optional[Tuple]:
                    "octomber":10,"octobar":10,"novembar":11,"decembar":12}
     _all_months = "|".join(sorted(month_names.keys(), key=len, reverse=True))
 
-    # ── DATE RANGE: "from MONTH YEAR to MONTH YEAR" ───────────────────────────
-    _range_pat = re.search(
-        rf"(?:from\s+)?({_all_months})\s+(20\d{{2}})\s+to\s+({_all_months})\s+(20\d{{2}})",
-        q, re.IGNORECASE
-    )
-    if _range_pat:
-        _m1 = month_names.get(_range_pat.group(1).lower())
-        _y1 = int(_range_pat.group(2))
-        _m2 = month_names.get(_range_pat.group(3).lower())
-        _y2 = int(_range_pat.group(4))
-        print(f"[Route] DateRange: {_range_pat.group(1)} {_y1} to {_range_pat.group(3)} {_y2}")
+    # ── DATE RANGE — handles all common phrasings ────────────────────────────
+    # Formats: "april-june 2025", "april to june 2025", "from april 2025 to june 2025"
+    #          "between april and june 2025", "apr 2025 - jun 2025"
+    _SEP = r"[\s]*(?:to|through|till|until|[-\u2013\u2014]|and)\s*"
+    _PAT_A = rf"(?:from\s+)?({_all_months})\s+(20\d{{2}})\s*{_SEP}({_all_months})\s+(20\d{{2}})"
+    _PAT_B = rf"(?:from\s+|between\s+)?({_all_months})\s*{_SEP}({_all_months})\s+(20\d{{2}})"
+    _rm = re.search(_PAT_A, q, re.IGNORECASE)
+    _m1_raw, _y1_raw, _m2_raw, _y2_raw = None, None, None, None
+    if _rm:
+        _m1_raw, _y1_raw, _m2_raw, _y2_raw = _rm.group(1), _rm.group(2), _rm.group(3), _rm.group(4)
+    else:
+        _rm = re.search(_PAT_B, q, re.IGNORECASE)
+        if _rm:
+            _m1_raw, _y1_raw = _rm.group(1), _rm.group(3)
+            _m2_raw, _y2_raw = _rm.group(2), _rm.group(3)
+    if _rm and _m1_raw and _m2_raw:
+        _m1 = month_names.get(_m1_raw.lower())
+        _y1 = int(_y1_raw)
+        _m2 = month_names.get(_m2_raw.lower())
+        _y2 = int(_y2_raw)
+        print(f"[Route] DateRange: {_m1_raw} {_y1} to {_m2_raw} {_y2}")
         if _m1 and _m2:
             import calendar as _cal
             _start = datetime(_y1, _m1, 1)
@@ -1193,7 +1203,7 @@ class MongoAIAgent:
         except: return False
 
     def query(self, question: str) -> Dict:
-        assert AGENT_VERSION == "4.29", f"Wrong agent version: {AGENT_VERSION}"
+        assert AGENT_VERSION == "4.30", f"Wrong agent version: {AGENT_VERSION}"
 
         if not self.llm and not self.init_llm():
             return {"error": "GROQ_API_KEY not configured."}
