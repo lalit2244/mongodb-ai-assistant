@@ -8,8 +8,26 @@ Root causes fixed in v4.4:
   3. Business collection also uses $in filter
   4. Item collection also uses $in filter
   5. resolve_company() now returns both obj_id and str_id always
+
+Fix v4.26: route() handles MONTH YEAR to MONTH YEAR date ranges.
+Fix v4.27: extract_company_name() pattern 6 + financial words in generic set.
+Fix v4.28: Combined v4.26+v4.27 fixes.
+Fix v4.29: route() ordering — date range block before voucher count checks.
+Fix v4.30: Voucher count checks guarded with miss("from","to","between","range").
+           Extended date range separator regex (_SEP) for april-june, april to june etc.
+
+Fix v4.31 — TWO bugs in extract_company_name():
+  BUG A: "company sales of april 2025 to jun 2025" → Pattern 1 captured
+    "sales of april 2025 to jun 2025", Pattern 8 captured "april 2025 to jun 2025"
+    → after year-strip returned "april" → fuzzy-matched a random company → wrong result.
+    FIX: (1) Pre-strip date expressions from query before matching.
+         (2) Run Pattern 1/2/3/8/10 on date-stripped query.
+         (3) Add month names to generic set so stripped month names are rejected.
+  BUG B: "cj enterprizes monthly trend", "cj enterprizes top customers" etc. returned
+    None because no pattern handled company-name-FIRST format.
+    FIX: Added Pattern 11 (new): r"^(COMPANY)\s+(?:sales|revenue|monthly|trend|...)"
 """
-AGENT_VERSION = "4.30"
+AGENT_VERSION = "4.31"
 print(f"[Agent] Loading agent.py version {AGENT_VERSION}")
 
 import os, json, re, calendar
@@ -242,48 +260,91 @@ def resolve_company_by_hex(client, hex_id: str) -> Optional[Dict]:
         print(f"[HexID] Failed: {e}")
         return None
 
+# Month alternation string — shared by extract_company_name and route()
+_MONTHS_RE = (r"jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|"
+              r"jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?")
+
+# Month names as a set — used in generic word rejection
+_MONTHS_SET = {
+    "january","february","march","april","may","june","july","august",
+    "september","october","november","december",
+    "jan","feb","mar","apr","jun","jul","aug","sep","oct","nov","dec",
+    "januray","januaray","janaury","februray","februvary","februrary","febuary","feburary",
+    "marchh","aprrl","appril","septembar","setember","septmber",
+    "octomber","octobar","novembar","decembar"
+}
+
 def extract_company_name(question: str) -> Optional[str]:
     q = question.strip()
     if re.search(r'\b[0-9a-fA-F]{24}\b', question):
         return None
+
+    # ── Pre-strip date expressions from question (v4.31 fix) ──────────────────
+    # Prevents "company sales of april 2025 to jun 2025" from leaking date tokens
+    # into company name extraction. Strips: "april 2025 to jun 2025",
+    # "from april 2025 to may 2025", "of april 2025", "in may 2025" etc.
+    _q_nodates = re.sub(
+        rf"(?:\s+(?:from|of|in))?\s+(?:{_MONTHS_RE})\s+20\d{{2}}"
+        rf"(?:\s*(?:to|till|through|[-\u2013\u2014])\s*(?:{_MONTHS_RE})\s+20\d{{2}})?",
+        "", q, flags=re.IGNORECASE).strip()
+
+    # Each tuple: (pattern, query_to_use)
+    # "nd" = use date-stripped query (_q_nodates)
+    # "orig" = use original question (for patterns that need full context)
     patterns = [
-        # Pattern 0: "for COMPANY" at very end of string — MUST be first to avoid
-        # greedy patterns capturing date+company together
-        r"(?:in|of|for)\s+([A-Za-z][A-Za-z /\-&.']{2,50}?)\s*$",
+        # Pattern 0: "for/in/of COMPANY" at very end of string
+        (r"(?:in|of|for)\s+([A-Za-z][A-Za-z /\-&.']{2,50}?)\s*$",                               "nd"),
+        # Pattern 11 (v4.31 NEW): COMPANY-FIRST — "CJ Enterprises sales...", "CJ Enterprises monthly trend"
+        # Catches all queries where company name appears before a keyword (no connector word needed)
+        (r"^([A-Za-z][A-Za-z0-9 /\-&.']{2,35}?)\s+(?:sales?\b|revenue\b|monthly\b|trend\b|customers?\b|vouchers?\b|stock\b|purchases?\b|suppliers?\b|products?\b|unpaid\b|invoices?\b|top\b|total\b)", "nd"),
         # Pattern 1: explicit "company X" keyword
-        r"company\s+(?:with|named?|called?|of|id|having|like)?\s*['\"]?([A-Za-z0-9][A-Za-z0-9 /\-&.']{2,50}?)['\"]?\s*(?:\?|$|\.|,)",
-        r"(?:in|for|of|from)\s+(?:the\s+)?company\s+['\"]?([A-Za-z0-9][A-Za-z0-9 /\-&.']{2,50}?)['\"]?\s*(?:\?|$|\.|,)",
-        r"(?:in|with|for|from)\s+['\"]?([A-Za-z0-9][A-Za-z0-9 /\-&.']{2,50}?)['\"]?\s+company\b",
-        # Pattern 4: vouchers/sales FOR company — restrict to letters only (no digits)
-        # to avoid capturing "april 2025 for CJ Enterprises" as company name
-        r"(?:vouchers?|sales?|purchases?|records?|revenue|invoices?)\s+(?:of|from)\s+['\"]?([A-Za-z][A-Za-z /\-&.']{2,40}?)['\"]?\s*(?:\?|$|\.|,)",
-        r"([A-Za-z0-9][A-Za-z0-9 /\-&.']{2,40}?)(?:'s)\s+(?:vouchers?|sales?|data|revenue|customers?)",
-        # Pattern: "for X vouchers/from" — catches "for CJ Enterprises vouchers from..."
-        r"(?:for|of)\s+([A-Za-z][A-Za-z0-9 /\-&.']{2,50}?)\s+(?:vouchers?\b|from\b)",
-        r"does\s+([A-Za-z0-9][A-Za-z0-9 /\-&.']{2,50}?)\s+have",
-        r"(?:customers?|suppliers?|vouchers?|sales?|stock|revenue|trend|products?)\s+(?:does|of|for)\s+([A-Za-z0-9][A-Za-z0-9 /\-&.']{2,50}?)(?:\s*\?|$)",
-        r"([A-Za-z0-9][A-Za-z0-9 /\-&.']{2,50}?)\s+(?:has|have|had)\s+(?:how many|\d)",
-        r"(?:show|get|give|tell)\s+(?:me\s+)?(?:the\s+)?(?:sales?|revenue|customers?|vouchers?|trend|stock|purchases?)\s+(?:of|for)\s+([A-Za-z0-9][A-Za-z0-9 /\-&.']{2,50}?)\s*(?:\?|$)",
+        (r"company\s+(?:with|named?|called?|of|id|having|like)?\s*['\"]?([A-Za-z0-9][A-Za-z0-9 /\-&.']{2,50}?)['\"]?\s*(?:\?|$|\.|,)",  "nd"),
+        (r"(?:in|for|of|from)\s+(?:the\s+)?company\s+['\"]?([A-Za-z0-9][A-Za-z0-9 /\-&.']{2,50}?)['\"]?\s*(?:\?|$|\.|,)",               "nd"),
+        (r"(?:in|with|for|from)\s+['\"]?([A-Za-z0-9][A-Za-z0-9 /\-&.']{2,50}?)['\"]?\s+company\b",                                      "nd"),
+        # Pattern 4: vouchers/sales FROM company — original query, but restrict to letters (no digits)
+        (r"(?:vouchers?|sales?|purchases?|records?|revenue|invoices?)\s+(?:of|from)\s+['\"]?([A-Za-z][A-Za-z /\-&.']{2,40}?)['\"]?\s*(?:\?|$|\.|,)", "orig"),
+        # Pattern 5: possessive
+        (r"([A-Za-z0-9][A-Za-z0-9 /\-&.']{2,40}?)(?:'s)\s+(?:vouchers?|sales?|data|revenue|customers?)",                                "orig"),
+        # Pattern 6: "for/of X vouchers from..."
+        (r"(?:for|of)\s+([A-Za-z][A-Za-z0-9 /\-&.']{2,50}?)\s+(?:vouchers?\b|from\b)",                                                  "orig"),
+        # Pattern 7: "does X have"
+        (r"does\s+([A-Za-z0-9][A-Za-z0-9 /\-&.']{2,50}?)\s+have",                                                                       "orig"),
+        # Pattern 8: "sales/revenue/... of/for X" — use nd to avoid date-polluted captures
+        (r"(?:customers?|suppliers?|vouchers?|sales?|stock|revenue|trend|products?)\s+(?:does|of|for)\s+([A-Za-z0-9][A-Za-z0-9 /\-&.']{2,50}?)(?:\s*\?|$)", "nd"),
+        # Pattern 9: "X has/have how many"
+        (r"([A-Za-z0-9][A-Za-z0-9 /\-&.']{2,50}?)\s+(?:has|have|had)\s+(?:how many|\d)",                                                "orig"),
+        # Pattern 10: "show/get/tell me the sales/revenue of/for X"
+        (r"(?:show|get|give|tell)\s+(?:me\s+)?(?:the\s+)?(?:sales?|revenue|customers?|vouchers?|trend|stock|purchases?)\s+(?:of|for)\s+([A-Za-z0-9][A-Za-z0-9 /\-&.']{2,50}?)\s*(?:\?|$)", "nd"),
     ]
     stopwords = {"company","the","a","an","in","for","of","with","has","have","me","my",
                  "all","this","that","these","those","its","their","collection","icompany",
                  "ibranch","iuser","voucher","item","id","search","find","get","show",
                  "list","fetch","what","which"}
+    # v4.31: month names added so a stripped month like "april" is rejected as company name
     generic   = {"sales","purchase","voucher","revenue","data","record","item","companies",
                  "trend","customer","invoice","monthly","total","how","many","what","most",
                  "collection","icompany","ibranch","search","find","created","highest","top",
                  "list","show","all","ranked","best","number","count","maximum",
-                 "fill","final","amount","bill","of"}
-    for pat in patterns:
-        m = re.search(pat, q, re.IGNORECASE)
+                 "fill","final","amount","bill","of","vouchers"} | _MONTHS_SET
+
+    for pat, use in patterns:
+        quse = _q_nodates if use == "nd" else q
+        m = re.search(pat, quse, re.IGNORECASE)
         if m:
             name = m.group(1).strip()
+            # Strip trailing stopwords
             name = re.sub(r'\b(' + '|'.join(re.escape(w) for w in stopwords) + r')\b\s*$',
                           '', name, flags=re.I).strip()
+            # Strip trailing "vouchers [from...]" artifact
+            name = re.sub(r'\s+vouchers?\b.*$', '', name, flags=re.I).strip()
+            # Strip trailing date fragments (month+year or standalone year)
+            name = re.sub(rf'\s+(?:{_MONTHS_RE})\s+20\d{{2}}.*$', '', name, flags=re.I).strip()
+            name = re.sub(r'\s+20\d{2}.*$', '', name).strip()
             words = name.lower().split()
             if (len(name) >= 3
                     and name.lower() not in generic
                     and not re.match(r'^[0-9a-fA-F]{24}$', name)
+                    and not re.search(r'\b20\d{2}\b', name)   # reject if year still in name
                     and not all(w in generic for w in words)):
                 return name
     return None
@@ -549,17 +610,6 @@ def route(question: str, company: Optional[Dict], db) -> Optional[Tuple]:
         if nm: lim = min(int(nm.group(1)), 50)
         return companies_by_voucher_count(db, vtype, lim)
 
-    # ── Voucher counts ────────────────────────────────────────────────────────
-    if re.search(r"how many.*(sales|purchase|receipt|payment).*(voucher|invoice|bill|record)|"
-                 r"(voucher|invoice|bill).*(count|how many|total number|number of)", q) and miss("from","to","between","range"):
-        vtype = ("sales" if "sales" in q else "purchase" if "purchase" in q else
-                 "receipt" if "receipt" in q else "payment" if "payment" in q else None)
-        return qb.voucher_count(vtype, n)
-
-    if re.search(r"how many voucher|voucher count|number of voucher|count.*voucher|total.*voucher", q) and miss("from","to","between","range"):
-        vtype = "sales" if "sales" in q else "purchase" if "purchase" in q else None
-        return qb.voucher_count(vtype, n)
-
     # ── Month name lookup table (shared by both range and single-month blocks) ─
     month_names = {"january":1,"february":2,"march":3,"april":4,"may":5,"june":6,
                    "july":7,"august":8,"september":9,"october":10,"november":11,"december":12,
@@ -573,9 +623,12 @@ def route(question: str, company: Optional[Dict], db) -> Optional[Tuple]:
                    "octomber":10,"octobar":10,"novembar":11,"decembar":12}
     _all_months = "|".join(sorted(month_names.keys(), key=len, reverse=True))
 
-    # ── DATE RANGE — handles all common phrasings ────────────────────────────
-    # Formats: "april-june 2025", "april to june 2025", "from april 2025 to june 2025"
-    #          "between april and june 2025", "apr 2025 - jun 2025"
+    # ── DATE RANGE — handles all common phrasings ─────────────────────────────
+    # Formats: "april-june 2025", "april to june 2025",
+    #          "from april 2025 to june 2025", "between april and june 2025",
+    #          "apr 2025 - jun 2025"
+    # Runs BEFORE voucher count checks so date-range queries are never hijacked
+    # by generic voucher-count regexes.
     _SEP = r"[\s]*(?:to|through|till|until|[-\u2013\u2014]|and)\s*"
     _PAT_A = rf"(?:from\s+)?({_all_months})\s+(20\d{{2}})\s*{_SEP}({_all_months})\s+(20\d{{2}})"
     _PAT_B = rf"(?:from\s+|between\s+)?({_all_months})\s*{_SEP}({_all_months})\s+(20\d{{2}})"
@@ -632,6 +685,17 @@ def route(question: str, company: Optional[Dict], db) -> Optional[Tuple]:
             ])
             return rows, {"type":"metric","x_field":None,"y_field":_sum_field,
                           "title":f"{n} — {_vt.title()} {_label1} {_y1}–{_label2} {_y2}"}
+
+    # ── Voucher counts — guarded with miss() to not fire on date-range queries ─
+    if re.search(r"how many.*(sales|purchase|receipt|payment).*(voucher|invoice|bill|record)|"
+                 r"(voucher|invoice|bill).*(count|how many|total number|number of)", q) and miss("from","to","between","range"):
+        vtype = ("sales" if "sales" in q else "purchase" if "purchase" in q else
+                 "receipt" if "receipt" in q else "payment" if "payment" in q else None)
+        return qb.voucher_count(vtype, n)
+
+    if re.search(r"how many voucher|voucher count|number of voucher|count.*voucher|total.*voucher", q) and miss("from","to","between","range"):
+        vtype = "sales" if "sales" in q else "purchase" if "purchase" in q else None
+        return qb.voucher_count(vtype, n)
 
     # ── Sales for specific single month+year ──────────────────────────────────
     _month_pat = re.search(rf"\b({_all_months})\b", q)
@@ -867,7 +931,8 @@ def schema_shortcut(q: str) -> Optional[Dict]:
             limit=200,tmpl="All companies.",ct="table",title="All Companies")
 
     if re.search(r"how many compan|no of compan|number of compan|count.*compan|compan.*count|"
-                  r"show.*compan|total.*compan|list.*how many|compan.*total", q) and        miss("with","in","for","sales","voucher","most","top","rank","customer","supplier"):
+                  r"show.*compan|total.*compan|list.*how many|compan.*total", q) and \
+       miss("with","in","for","sales","voucher","most","top","rank","customer","supplier"):
         return plan("aggregate","ICompany",
             pipe=[{"$count":"total_companies"}],
             tmpl="Total companies.",ct="metric",y="total_companies",
@@ -1203,7 +1268,7 @@ class MongoAIAgent:
         except: return False
 
     def query(self, question: str) -> Dict:
-        assert AGENT_VERSION == "4.30", f"Wrong agent version: {AGENT_VERSION}"
+        assert AGENT_VERSION == "4.31", f"Wrong agent version: {AGENT_VERSION}"
 
         if not self.llm and not self.init_llm():
             return {"error": "GROQ_API_KEY not configured."}
@@ -1217,9 +1282,6 @@ class MongoAIAgent:
             return direct
 
         # ── Step 1: Company ranking — MUST run before company resolution ────────
-        # "top 5 companies by sales vouchers" contains "compan" which would
-        # accidentally fuzzy-match a company name if resolution ran first.
-        # Company ranking is a GLOBAL query — no company filter needed.
         _rp = (r"(companies|company).*(most|top|highest|ranked?|maximum|max|list).*(voucher|sales)|"
                r"(most|top|highest).*(voucher|sales).*(compan)|"
                r"top\s*\d*\s*compan.*(sales|voucher)|compan.*by.*(sales|voucher)|"
@@ -1243,9 +1305,6 @@ class MongoAIAgent:
                     "chart":chart,"plan":plan,"db_error":None}
 
         # ── Step 2: Resolve company (after ranking check) ────────────────────
-        # Only runs if question is NOT a global ranking query.
-        # FIX: removed aggressive fallback resolve_company(client, question)
-        # that was fuzzy-matching company names from generic questions.
         company = None
 
         # 2a: Hex ID in question + analytics keywords → resolve directly
@@ -1260,8 +1319,6 @@ class MongoAIAgent:
             if cname and self.client:
                 company = resolve_company(self.client, cname)
                 print(f"[Query] resolve_company result: {company['name'] if company else 'NOT FOUND'}")
-                # NOTE: removed fallback resolve_company(client, full_question)
-                # that was accidentally matching generic words as company names
                 if company is None:
                     return {
                         "type":"answer",
@@ -1271,8 +1328,6 @@ class MongoAIAgent:
                     }
 
         # ── Step 3: Global schema shortcuts (ONLY when no company detected) ───
-        # If a company was found in Step 1, skip this entirely so we never
-        # return unfiltered global data for a company-specific question.
         if company is None:
             sc = schema_shortcut(q_low)
             if sc:
@@ -1331,11 +1386,9 @@ class MongoAIAgent:
         return {"type":"answer","answer":answer,"results":results,
                 "chart":chart,"plan":plan,"db_error":err}
 
-
     def _direct_id_or_collection_query(self, question: str, db) -> Optional[Dict]:
         if db is None: return None
         q = question.strip()
-
         SKIP_FIELDS = {
             "_id","__v","id","logoUrl","pancard","gstNo","primaryBranchId",
             "eShopPathName","eShopViewCount","iShopSettings","printSettings",
@@ -1346,13 +1399,11 @@ class MongoAIAgent:
             "defaultTax","itemGroups","__typename","isDeleted","isActive",
             "permissions","settings","config","metadata","createdAt",
         }
-
         hex_id_match = re.search(r'\b([0-9a-fA-F]{24})\b', q)
         if hex_id_match:
             hex_id = hex_id_match.group(1)
             if _ANALYTICS_KW.search(question) and not _LOOKUP_KW.search(question):
                 return None
-
             obj_id = ObjectId(hex_id)
             col_map = {"icompany":"ICompany","company":"ICompany",
                        "voucher":"Voucher","invoice":"Voucher",
@@ -1364,7 +1415,6 @@ class MongoAIAgent:
             col   = "ICompany"
             for kw, c in col_map.items():
                 if kw in q_low: col = c; break
-
             try:
                 doc = db[col].find_one({"_id": obj_id})
                 if not doc:
@@ -1393,9 +1443,6 @@ class MongoAIAgent:
                 pass
 
         col_explicit = None
-        # Only match collection keywords when NOT an analytics question
-        # "list of sales vouchers in april 2025" is analytics, not a collection dump
-        # "list all ICompany" IS a collection dump
         if not _ANALYTICS_KW.search(question):
             for kw, cn in [("icompany","ICompany"),("ibranch","IBranch"),("iuser","IUser"),
                             ("item quantitytracker","ItemQuantityTracker"),
@@ -1403,8 +1450,6 @@ class MongoAIAgent:
                             ("business","Business"),
                             ("account","Account"),("contact","Contact")]:
                 if kw in q.lower(): col_explicit = cn; break
-        # Voucher/Item are NEVER used as collection dumps — always analytics
-        # They get handled by route() instead
 
         if col_explicit and re.search(r"(find|search|get|show|list|fetch|what|which|name|all)", q.lower()):
             proj = None; fq = {}
